@@ -11,12 +11,12 @@
 ---
 
 <p align="center">
-PCLA (Pretrained CARLA Leaderboard Agents) is a versatile framework that allows you to utilize the autonomous agents from the <a href="https://leaderboard.carla.org/leaderboard/">CARLA Leaderboard</a> independently of its core codebase and put them on your vehicle. </br>
+PCLA (Pretrained CARLA Leaderboard Agents) is a versatile framework that allows you to use and evaluate the autonomous agents from the <a href="https://leaderboard.carla.org">CARLA Leaderboard</a> independently of its core codebase and put them on your vehicle. </br>
 
 * PCLA provides a clear method to deploy Autonomous Driving Agents (ADAs) onto a vehicle without relying on the Leaderboard codebase.
 * Enables easy switching between ADAs without requiring changes to CARLA versions or programming environments.
 * Allows you to have multiple vehicles with different autonomous agents (requires high graphical memory).
-* Provides the next movement action computed by the chosen agent, which can then be utilized in any desired application.
+* Provides the next movement action computed by the chosen agent, which can then be used in any desired application.
 * Is fully compatible with the latest version of CARLA and independent of the Leaderboard’s specific CARLA version.
 * Includes **16** different high-performing ADAs trained with 24 distinct training seeds. 
 
@@ -25,14 +25,13 @@ Paper available at <a href="https://dl.acm.org/doi/abs/10.1145/3696630.3728577">
 </p>
 
 <p align="center">
-<strong>PCLA was tested on Linux Ubuntu 22 and CARLA 9.15.2 Unreal Engine 4.</strong> </br>
+<strong>PCLA was tested on Linux Ubuntu 22 and CARLA 0.9.16 Unreal Engine 4.</strong> </br>
 A video tutorial on how to use PCLA is available below (update will come soon).
   
 <div align="center">
   <a href="https://www.youtube.com/watch?v=QyaMK6vclBg"><img src="https://img.youtube.com/vi/QyaMK6vclBg/0.jpg" alt="PCLA Video Tutorial"></a>
 </div>
 
-<b style="font-size: 20px; color: #E44D26;">PCLA 2 will soon be released to support CARLA 9.16 and Python 3.12</b>
 </p>
 
 
@@ -64,6 +63,14 @@ conda activate PCLA
 ```
 Please make sure to install torch-scatter according to your own CUDA version. You can check your CUDA version using the `python cuda.py` code.
 
+--If you want to use PCLA for **CARLA 0.9.16**, you need to install the wheel from the `dist` folder.
+
+```Shell
+cd dist
+python3 -m pip install carla-0.9.16-cp38-cp38-linux_x86_64.whl
+```
+**Note**: Some agents act _weird_ in CARLA 0.9.16
+
 ## Pre-Trained Weights
 
 Download the pre-trained weights from <a href="https://zenodo.org/records/17110968">Zenodo</a> or directly from <a href="https://zenodo.org/records/17110968/files/pretrained.zip?download=1">here</a> and extract them into the `PCLA/agents/` directory.</br>
@@ -89,12 +96,12 @@ Ensure that each folder of pre-trained weights is placed directly next to its re
 PCLA includes 14 different autonomous agents and 21 distinct training seeds to choose from.
 - **SimLingo(CarLLava)**
   - Contains 1 agent from the leaderboard 2, previously named CarLLava.
-    - **simlingo_simlingo** : The best performing agent, first place at <a href="https://leaderboard.carla.org/leaderboard/">CARLA Leaderboard 2</a> SENSORS track.
+    - **simlingo_simlingo** : The best performing agent, first place at <a href="https://leaderboard.carla.org">CARLA Leaderboard 2</a> SENSORS track.
   - <a href="https://github.com/RenzKa/simlingo ">Repository</a>
     
 - **Transfuser++**
   - Contains 4 different autonomous agents of Transfuser++ with 3 training seeds for each agent. To use these agents, you need to set some [Environment Variables](#environment-variables).
-    - **tfpp_l6_#** : Best performing Transfuser++ agent. Second place at <a href="https://leaderboard.carla.org/leaderboard/">CARLA Leaderboard 2</a> SENSORS track(Tuebingen_AI team)
+    - **tfpp_l6_#** : Best performing Transfuser++ agent. Second place at <a href="https://leaderboard.carla.org">CARLA Leaderboard 2</a> SENSORS track(Tuebingen_AI team)
     - **tfpp_lav_#** : Transfuser++ but it's not trained on Town02 and Town05.
     - **tfpp_wp_#** : Transfuser++ WP from their paper's appendix.
     - **tfpp_aim_#** : Reproduction of the <a href="https://openaccess.thecvf.com/content/CVPR2021/html/Prakash_Multi-Modal_Fusion_Transformer_for_End-to-End_Autonomous_Driving_CVPR_2021_paper.html" target="_blank">AIM </a>method, explained in their paper's appendix.
@@ -130,7 +137,7 @@ PCLA includes 14 different autonomous agents and 21 distinct training seeds to c
     
 - **Interfuser**
   - Contains 1 autonomous agent. To use this agent, you need to set an [Environment Variables](#environment-variables).
-     - **if_if** : Second best performing <a href="https://leaderboard.carla.org/leaderboard/">CARLA Leaderboard 1</a> SENSORS track agent.
+     - **if_if** : Second best performing <a href="https://leaderboard.carla.org">CARLA Leaderboard 1</a> SENSORS track agent.
   - <a href="https://github.com/opendilab/InterFuser">Repository</a>
 
 ## How to Use
@@ -183,7 +190,6 @@ endLoc = vehicle_spawn_points[42].location # End location
 waypoints = location_to_waypoint(client, startLoc, endLoc) # Returns waypoints between two locations
 ```
 
-<hr />
 
 Then pass the waypoints to `route_maker()` to make the XML file usable for PCLA.
 ```python
