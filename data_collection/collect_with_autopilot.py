@@ -46,7 +46,7 @@ def stop_carla(port=None):
 
 def _wait_for_carla(port, timeout=120):
     """Poll the RPC port until the server responds or timeout."""
-    client = carla.Client("127.0.0.1", port)
+    client = carla.Client("localhost", port)
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -57,14 +57,13 @@ def _wait_for_carla(port, timeout=120):
             time.sleep(1.0)
     return False
 
-def start_carla(carla_path, port=2000, gpu=False):
-    if not carla_path:
-        raise ValueError("You must pass --carla-path=/path/to/CarlaUE4.sh when --restart-carla is set.")
+def start_carla(args):
+    carla_path = args.carla_path
+    port       = args.port
+    gpu        = args.gpu
 
-    # Headless-friendly environment
-    env = os.environ.copy()
-    env.setdefault("SDL_VIDEODRIVER", "offscreen")
-    env.setdefault("DISPLAY", "")
+    if not carla_path:
+        raise ValueError("You must pass --carla-path=/path/to/CarlaUE4.sh when --start-carla or --restart-carla is set.")
 
     cmd = [
         carla_path,
@@ -87,8 +86,7 @@ def start_carla(carla_path, port=2000, gpu=False):
         cmd,
         stdout=logf,
         stderr=subprocess.STDOUT,
-        start_new_session=True,
-        env=env,
+        start_new_session=True
     )
 
     # Save pidfile for precise shutdowns
@@ -108,9 +106,9 @@ def start_carla(carla_path, port=2000, gpu=False):
     return proc
 
 def restart_carla(args):
-    print("try to restart carla", flush=True)
+    print("Try to restart carla", flush=True)
     stop_carla(args.port)  # fast, pidfile-based; falls back to user-scoped pkill
-    return start_carla(args.carla_path, port=args.port, gpu=args.gpu)
+    return start_carla(args)
 
 def ensure_dir(p): Path(p).mkdir(parents=True, exist_ok=True)
 
@@ -313,7 +311,8 @@ def main():
     parser.add_argument("--min-speed-kmh", type=float, default=3.0,
                         help="Only record when ego speed >= this (km/h)")
     parser.add_argument("--stall-patience", type=int, default=5,
-                        help="# consecutive slow frames before pausing recording")
+                        help="Consecutive slow frames before pausing recording")
+    parser.add_argument("--start-carla", action="store_true", help="Start CARLA on run")
     parser.add_argument("--restart-carla", action="store_true", help="Restart CARLA on run")
     parser.add_argument("--gpu", type=bool, default=True, help="Use GPU to run CARLA")
     parser.add_argument("--carla-path", default=None, help="Path to CARLA script (i.e., CarlaUE4.sh)")
@@ -325,10 +324,12 @@ def main():
     root_out = os.path.join(args.out, timestamp_str)
     os.makedirs(root_out, exist_ok=True)
 
-    if (args.restart_carla):
+    if args.restart_carla:
         restart_carla(args)
+    elif args.start_carla:
+        start_carla(args)
     
-    client = carla.Client("127.0.0.1", args.port)
+    client = carla.Client("localhost", args.port)
     client.set_timeout(60.0)
 
     # Decide which towns to run
