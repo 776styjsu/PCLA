@@ -4,36 +4,43 @@
 set -e
 set -o pipefail
 
-USAGE_STRING="usage: collect_batch.sh [-h] [-n steps] [-f fps]
+USAGE_STRING="usage: collect_batch.sh [-h] [-n steps] [-s fps] [-f path/to/Carla.sh] [-o path/to/output] [-r]
   -h    Displays this help message.
   -n N  Number of steps for data collection for each map
-  -f N  Number of frames per second for data collection
+  -s N  Frames per second for data collection
+  -f N  Path to CARLA script
   -o N  Output directory name
-  Example: commons-lang3-3.0"
+  -r    Restart CARLA for each map
+  Example: collect_batch.sh -n 1200 -s 10 -f ../../carla-0.9.15/CarlaUE4.sh -o out"
 
+# Default values
 STEPS=1200
 FPS=10
 OUTPUT_DIR="out_autopilot"
+restart=false
+CARLA_PATH=""
 
 # Parse command-line arguments
-while getopts ":hvrf:ao:t:c:n:" opt; do
+while getopts ":hn:s:f:o:r" opt; do
   case ${opt} in
     h)
-      # Display help message
       echo "$USAGE_STRING"
       exit 0
       ;;
     n)
-      # Number of steps
       STEPS="$OPTARG"
       ;;
-    f)
-      # FPS
+    s)
       FPS="$OPTARG"
       ;;
+    f)
+      CARLA_PATH="$OPTARG"
+      ;;
     o)
-      # Output dir
-      OUT_DIR="$OPTARG"
+      OUTPUT_DIR="$OPTARG"
+      ;;
+    r)
+      restart=true
       ;;
     \?)
       echo "Invalid option: -$OPTARG" >&2
@@ -48,14 +55,36 @@ while getopts ":hvrf:ao:t:c:n:" opt; do
   esac
 done
 
-MAPS=("Town01" "Town01_Opt" "Town02" "Town02_Opt" "Town03" "Town03_Opt" \
-      "Town04" "Town04_Opt" "Town05" "Town05_Opt" "Town06" "Town07" \
-      "Town10HD" "Town10HD_Opt" "Town11" "Town12" "Town13" "Town15")
+# Town list (excluding *_Opt variants that may cause segfaults)
+MAPS=("Town01" "Town02" "Town03" "Town04" "Town05" "Town06" "Town07" \
+      "Town10HD" "Town11" "Town12" "Town13" "Town15")
+
+ALL_TOWNS=$(IFS=, ; echo "${MAPS[*]}")
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
-for map in "${MAPS[@]}"; do
+if $restart; then
+  if [[ -z "$CARLA_PATH" ]]; then
+    echo "Error: -f <CARLA_PATH> is required when using -r." >&2
+    echo "$USAGE_STRING"
+    exit 1
+  fi
+  for map in "${MAPS[@]}"; do
     echo "Running script on $map"
     run_dir="${map}-${TIMESTAMP}"
-    python collect_with_autopilot.py --town="$map" --steps="$STEPS" --fps="$FPS" --out="$OUTPUT_DIR/${run_dir}"
-done
+    python collect_with_autopilot.py \
+      --town="$map" \
+      --steps="$STEPS" \
+      --fps="$FPS" \
+      --out="$OUTPUT_DIR/${run_dir}" \
+      --restart-carla \
+      --carla-path="$CARLA_PATH"
+  done
+else
+  run_dir="all-${TIMESTAMP}"
+  python collect_with_autopilot.py \
+    --towns="$ALL_TOWNS" \
+    --steps="$STEPS" \
+    --fps="$FPS" \
+    --out="$OUTPUT_DIR/${run_dir}"
+fi

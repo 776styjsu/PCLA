@@ -1,8 +1,116 @@
-import os, json, time, math, random, argparse
+import os, json, time, math, random, argparse, subprocess, signal
 from pathlib import Path
 from collections import deque
 from datetime import datetime
 import carla
+
+PIDFILE_TMPL = "./carla_{port}.pid"
+LOGFILE_TMPL = "./carla_{port}.log"
+
+def stop_carla(port=None):
+    """Stop a CARLA server we launched earlier (prefer pidfile; else restricted pkill)."""
+    # 1) Try pidfile-based group kill (fast, no global scans)
+    if port is not None:
+        pidfile = PIDFILE_TMPL.format(port=port)
+        if os.path.exists(pidfile):
+            try:
+                with open(pidfile) as f:
+                    pid = int(f.read().strip())
+                # Kill the whole process group started by Popen(start_new_session=True)
+                os.killpg(pid, signal.SIGTERM)
+                time.sleep(1.0)
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                print(f"Stopped CARLA pgid {pid} (port {port})")
+            except Exception as e:
+                print(f"Warning: failed to kill CARLA by pidfile: {e}")
+            finally:
+                try:
+                    os.remove(pidfile)
+                except OSError:
+                    pass
+            return
+
+    # 2) Fallback: restricted pkill (your user only, exact names), time-bounded
+    user = os.environ.get("USER", "")
+    for name in ("CarlaUE4-Linux-Shipping", "CarlaUE4.sh", "CarlaUE4"):
+        for args in (["pkill", "-u", user, "-x", name],
+                     ["pkill", "-9", "-u", user, "-x", name]):
+            try:
+                subprocess.run(args, check=False, timeout=3)
+            except subprocess.TimeoutExpired:
+                print(f"pkill timed out for {name}; continuing")
+    print("Stopped any existing CARLA servers (fallback)")
+
+def _wait_for_carla(port, timeout=120):
+    """Poll the RPC port until the server responds or timeout."""
+    client = carla.Client("127.0.0.1", port)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            client.set_timeout(2.0)
+            _ = client.get_server_version()
+            return True
+        except Exception:
+            time.sleep(1.0)
+    return False
+
+def start_carla(carla_path, port=2000, gpu=False):
+    if not carla_path:
+        raise ValueError("You must pass --carla-path=/path/to/CarlaUE4.sh when --restart-carla is set.")
+
+    # Headless-friendly environment
+    env = os.environ.copy()
+    env.setdefault("SDL_VIDEODRIVER", "offscreen")
+    env.setdefault("DISPLAY", "")
+
+    cmd = [
+        carla_path,
+        f"-carla-rpc-port={port}",
+        "-RenderOffScreen",
+        "-nosound",
+    ]
+
+    print(f"cmd: {cmd}")
+
+    if not gpu:
+        cmd.append("-opengl")
+
+    # Log to /tmp so we can debug crashes
+    log_path = LOGFILE_TMPL.format(port=port)
+    logf = open(log_path, "ab", buffering=0)
+
+    # Start in a new session so we can kill the whole group later
+    proc = subprocess.Popen(
+        cmd,
+        stdout=logf,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=env,
+    )
+
+    # Save pidfile for precise shutdowns
+    pidfile = PIDFILE_TMPL.format(port=port)
+    try:
+        with open(pidfile, "w") as f:
+            f.write(str(proc.pid))
+    except Exception:
+        pass
+
+    print(f"Started CARLA on port {port}, PID={proc.pid}. Logs: {log_path}", flush=True)
+
+    # Wait until the server is actually ready
+    if not _wait_for_carla(port, timeout=120):
+        raise RuntimeError(f"CARLA failed to come up on port {port}. Check log: {log_path}")
+
+    return proc
+
+def restart_carla(args):
+    print("try to restart carla", flush=True)
+    stop_carla(args.port)  # fast, pidfile-based; falls back to user-scoped pkill
+    return start_carla(args.carla_path, port=args.port, gpu=args.gpu)
 
 def ensure_dir(p): Path(p).mkdir(parents=True, exist_ok=True)
 
@@ -166,19 +274,24 @@ def collect_once_on_world(client, tm, args, out_dir):
                 # when paused, skip waiting and skip logging (and don't count a step)
                 pass
     finally:
+        # 1. Stop sensors and ego autopilot
         camera.stop()
         if agent is None:
             ego.set_autopilot(False)
+
+        # 2. Tell the TM to release control of the NPCs
+        for a in traffic_actors:
+            if a.is_alive:
+                a.set_autopilot(False, tm.get_port())
+        
+        # 3. Destroy actors
         for a in traffic_actors:
             if a.is_alive: a.destroy()
         if ego.is_alive: ego.destroy()
 
-        # restore async & close file
-        tm.set_synchronous_mode(False)
-        settings.synchronous_mode = False
-        settings.fixed_delta_seconds = None
-
-        world.apply_settings(settings)
+        # 4. Tick once to process destruction
+        world.tick()
+        
         meas_f.close()
 
 
@@ -192,15 +305,18 @@ def main():
     parser.add_argument("--tm-port", type=int, default=20500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-npcs", type=int, default=40)
-    parser.add_argument("--rgb_width", type=int, default=1280)
-    parser.add_argument("--rgb_height", type=int, default=720)
+    parser.add_argument("--rgb-width", type=int, default=1280)
+    parser.add_argument("--rgb-height", type=int, default=720)
     parser.add_argument("--town", default=None, help="Run only on this town")
     parser.add_argument("--towns", default=None, help="Comma-separated list of towns (e.g., Town01,Town03)")
     parser.add_argument("--all-towns", action="store_true", help="Run on every installed map")
-    parser.add_argument("--min_speed_kmh", type=float, default=3.0,
+    parser.add_argument("--min-speed-kmh", type=float, default=3.0,
                         help="Only record when ego speed >= this (km/h)")
-    parser.add_argument("--stall_patience", type=int, default=5,
+    parser.add_argument("--stall-patience", type=int, default=5,
                         help="# consecutive slow frames before pausing recording")
+    parser.add_argument("--restart-carla", action="store_true", help="Restart CARLA on run")
+    parser.add_argument("--gpu", type=bool, default=True, help="Use GPU to run CARLA")
+    parser.add_argument("--carla-path", default=None, help="Path to CARLA script (i.e., CarlaUE4.sh)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -209,7 +325,10 @@ def main():
     root_out = os.path.join(args.out, timestamp_str)
     os.makedirs(root_out, exist_ok=True)
 
-    client = carla.Client("localhost", args.port)
+    if (args.restart_carla):
+        restart_carla(args)
+    
+    client = carla.Client("127.0.0.1", args.port)
     client.set_timeout(60.0)
 
     # Decide which towns to run
@@ -224,21 +343,39 @@ def main():
         towns = [normalize_map_name(client.get_world().get_map().name)]
 
     tm = client.get_trafficmanager(args.tm_port)
-    tm.set_synchronous_mode(False)
+    # Initial setup
+    tm.set_synchronous_mode(True)
     tm.set_random_device_seed(args.seed)
     tm.set_global_distance_to_leading_vehicle(2.5)
-    print(towns)
-    for town in towns:
-        print(f"=== Collecting on {town} ===")
-        # Load the town (reload even if it's already active to reset state)
-        world = client.load_world(town)
+    
+    try:
+        for town in towns:
+            print(f"=== Collecting on {town} ===")
+            
+            # Force TM back to sync mode before loading the next world
+            tm.set_synchronous_mode(True)
 
-        # Per-town output folder
-        town_out = os.path.join(root_out, town)
-        ensure_dir(town_out)
+            # Load the town and tick once for stability
+            world = client.load_world(town)
+            time.sleep(10.0)
+            world.tick()
 
-        # Run one episode on this world
-        collect_once_on_world(client, tm, args, town_out)
+            # Per-town output folder
+            town_out = os.path.join(root_out, town)
+            ensure_dir(town_out)
+
+            # Run one episode on this world
+            collect_once_on_world(client, tm, args, town_out)
+
+    finally:
+        print("Collection finished. Restoring async mode.")
+        # Make sure we have a valid world object for cleanup
+        world = client.get_world()
+        settings = world.get_settings()
+        tm.set_synchronous_mode(False)
+        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = None
+        world.apply_settings(settings)
 
     print(f"Saved data to: {root_out}")
 
