@@ -84,6 +84,7 @@ class MultiTaskAgent(autonomous_agent1.AutonomousAgent):
 			(self.save_path / 'out').mkdir(parents=True, exist_ok=False)
 			(self.save_path / 'img').mkdir(parents=True, exist_ok=False)
 			(self.save_path / 'meta').mkdir(parents=True, exist_ok=False)
+			(self.save_path / 'sal').mkdir(parents=True, exist_ok=False)
 
 	def _init(self):
 		self._route_planner = RoutePlanner(4.0, 50.0)
@@ -194,7 +195,7 @@ class MultiTaskAgent(autonomous_agent1.AutonomousAgent):
 
 		return result
 
-	@torch.no_grad()
+	# @torch.no_grad()
 	def run_step(self, input_data, timestamp):
 		if not self.initialized:
 			self._init()
@@ -242,10 +243,20 @@ class MultiTaskAgent(autonomous_agent1.AutonomousAgent):
 				images.append(self.input_buffer['rgb_left'][i])
 				images.append(self.input_buffer['rgb_right'][i])
 
-		encoding = self.net.encoder(images, gt_velocity)
+		# encoding = self.net.encoder(images, gt_velocity)
 		
-		pred_waypoint_mean, red_light_occ = self.net.plan(target_point, encoding, self.plan_grid, self.light_grid, self.config.plan_points, self.config.plan_iters)
-		steer, throttle, brake, metadata = self.net.control_pid(pred_waypoint_mean[:, self.config.seq_len:], gt_velocity, target_point, red_light_occ)
+		# pred_waypoint_mean, red_light_occ = self.net.plan(target_point, encoding, self.plan_grid, self.light_grid, self.config.plan_points, self.config.plan_iters)
+		# steer, throttle, brake, metadata = self.net.control_pid(pred_waypoint_mean[:, self.config.seq_len:], gt_velocity, target_point, red_light_occ)
+		with torch.no_grad():
+			encoding = self.net.encoder(images, gt_velocity)
+			pred_waypoint_mean, red_light_occ = self.net.plan(
+				target_point, encoding, self.plan_grid, self.light_grid,
+				self.config.plan_points, self.config.plan_iters
+			)
+			steer, throttle, brake, metadata = self.net.control_pid(
+				pred_waypoint_mean[:, self.config.seq_len:], gt_velocity, target_point, red_light_occ
+			)
+
 
 		self.encoding_model = encoding
 		self.pred_waypoint_mean_model = pred_waypoint_mean
@@ -262,6 +273,64 @@ class MultiTaskAgent(autonomous_agent1.AutonomousAgent):
 		control.steer = steer
 		control.throttle = throttle
 		control.brake = brake
+
+		# === SALIENCY START (fresh graph; grad only on latest frame) ===
+		with torch.enable_grad():
+			cams = ['rgb', 'rgb_left', 'rgb_right'] if self.config.num_camera == 3 else ['rgb']
+			last_t = self.config.seq_len - 1
+
+			# Rebuild inputs the encoder expects (seq_len * num_cams),
+			# enabling grads ONLY on the last timestep frames.
+			grad_images = []
+			for i in range(self.config.seq_len):
+				for cam in cams:
+					x = self.input_buffer[cam][i].detach().clone()
+					x.requires_grad_(i == last_t)
+					grad_images.append(x)
+
+			# Detach non-visual conditions so they don't carry graph
+			tp = target_point.detach()
+			vel = gt_velocity.detach()
+
+			enc_g = self.net.encoder(grad_images, vel)
+			pred_wp_g, red_occ_g = self.net.plan(
+				tp, enc_g, self.plan_grid, self.light_grid,
+				self.config.plan_points, self.config.plan_iters
+			)
+
+			# Explain the x-offset of the first FUTURE waypoint
+			scalar = pred_wp_g[:, self.config.seq_len, 0].sum()
+
+			# Collect grads w.r.t. the grad-enabled inputs (last timestep across cams)
+			base = last_t * len(cams)
+			grad_vars = [grad_images[base + k] for k in range(len(cams))]
+
+			grads = torch.autograd.grad(
+				scalar, grad_vars,
+				retain_graph=False, create_graph=False, allow_unused=True
+			)
+
+			saliency_maps = {}
+			for cam, g in zip(cams, grads):
+				if g is None:
+					continue
+				sal = g.abs().sum(dim=1, keepdim=True)              # (1,1,H,W)
+				sal = (sal / (sal.max() + 1e-8)).detach().cpu().squeeze(0).squeeze(0).numpy()
+				saliency_maps[cam] = sal
+
+			self.saliency_maps = saliency_maps
+		# === SALIENCY END ===
+
+		# Print out some control information
+		tp0 = tick_data['target_point'][0].item() if torch.is_tensor(tick_data['target_point'][0]) else tick_data['target_point'][0]
+		tp1 = tick_data['target_point'][1].item() if torch.is_tensor(tick_data['target_point'][1]) else tick_data['target_point'][1]
+		spd = float(tick_data['speed'])
+
+		print(
+			f'step={self.step}, command={int(tick_data["next_command"])}, '
+			f'throttle={throttle:.2f}, brake={brake:.2f}, steer={steer:.2f}, '
+			f'speed={spd:.2f}, target=({tp0:.2f},{tp1:.2f})'
+		)
 
 		if SAVE_PATH is not None and self.step % 10 == 0:
 			self.save(tick_data)
@@ -347,6 +416,38 @@ class MultiTaskAgent(autonomous_agent1.AutonomousAgent):
 			if not os.path.isdir(self.save_path / 'flow' / str(frame).zfill(4)):
 				os.mkdir(self.save_path / 'flow' / str(frame).zfill(4))
 			flow_display.save(f"{self.save_path}/flow/{str(frame).zfill(4)}/{str(i)}.png")
+
+		# === SAVE SALIENCY ONCE PER FRAME ===
+		if hasattr(self, 'saliency_maps') and isinstance(self.saliency_maps, dict):
+			frame_dir = self.save_path / 'sal' / str(frame).zfill(4)
+			frame_dir_raw = self.save_path / 'sal_raw' / str(frame).zfill(4)
+			frame_dir.mkdir(parents=True, exist_ok=True)
+			frame_dir_raw.mkdir(parents=True, exist_ok=True)
+
+			cams = ['rgb', 'rgb_left', 'rgb_right'] if self.config.num_camera == 3 else ['rgb']
+			last_t = self.config.seq_len - 1
+
+			for cam in cams:
+				sal = self.saliency_maps.get(cam)
+				if sal is None:
+					continue
+
+				# normalize to [0,1] and build heatmap
+				sal = np.clip(sal, 0.0, 1.0)
+				sal_u8 = (sal * 255).astype(np.uint8)  # (H, W)
+				heat_bgr = cv2.applyColorMap(sal_u8, cv2.COLORMAP_JET)
+
+				# fetch the explained input frame (256x256 crop from buffer)
+				img_t = (self.input_buffer[cam][last_t][0]
+							.detach().cpu().numpy().transpose(1, 2, 0).astype(np.uint8))  # RGB
+				img_bgr = cv2.cvtColor(img_t, cv2.COLOR_RGB2BGR)
+
+				overlay_bgr = cv2.addWeighted(img_bgr, 0.6, heat_bgr, 0.4, 0.0)
+				overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
+
+				Image.fromarray(overlay_rgb).save(frame_dir / f'{cam}.png')
+				Image.fromarray(cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)).save(frame_dir_raw / f'{cam}_heat.png')
+				Image.fromarray(sal_u8).save(frame_dir_raw / f'{cam}_gray.png')
 
 	def destroy(self):
 		del self.net
