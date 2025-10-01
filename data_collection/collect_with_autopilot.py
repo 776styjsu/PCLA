@@ -140,8 +140,6 @@ def attach_front_rgb(world, bp_lib, parent, out_dir, width, height, fov=90):
 
     def _on_img(img):
         # only save/queue when recording
-        if not state["recording"]:
-            return
         img.save_to_disk(os.path.join(img_dir, f"{img.frame:06d}.png"))
         q.append(img.frame)
 
@@ -215,7 +213,7 @@ def collect_once_on_world(client, tm, args, out_dir):
 
         steps_done = 0
         ticks_seen = 0
-        TICK_CAP = args.steps * 50
+        TICK_CAP = args.steps * 5
 
         while steps_done < args.steps and ticks_seen < TICK_CAP:
             if agent is not None:
@@ -244,33 +242,32 @@ def collect_once_on_world(client, tm, args, out_dir):
                 recording = should_record
                 set_recording(recording)  # flip the camera saver on/off
 
+            # only wait for and log frames when recording
+            t0 = time.time()
+            while frame not in img_queue and time.time() - t0 < 2.0:
+                time.sleep(0.001)
+
+            ctrl = ego.get_control()
+            rec = {
+                "frame": frame,
+                "location": {"x": tf.location.x, "y": tf.location.y, "z": tf.location.z},
+                "rotation": {"pitch": tf.rotation.pitch, "yaw": tf.rotation.yaw, "roll": tf.rotation.roll},
+                "speed_kmh": spd_kmh,
+                "control": {
+                    "throttle": ctrl.throttle, "steer": ctrl.steer, "brake": ctrl.brake,
+                    "reverse": ctrl.reverse, "hand_brake": ctrl.hand_brake,
+                    "manual_gear_shift": ctrl.manual_gear_shift, "gear": ctrl.gear,
+                },
+                "image_path": f"images/{frame:06d}.png",
+                "mode": args.mode,
+                "town": Path(world.get_map().name).name,
+                "recording": recording
+            }
+            meas_f.write(json.dumps(rec) + "\n")
+
             if recording:
-                # only wait for and log frames when recording
-                t0 = time.time()
-                while frame not in img_queue and time.time() - t0 < 2.0:
-                    time.sleep(0.001)
-
-                ctrl = ego.get_control()
-                rec = {
-                    "frame": frame,
-                    "location": {"x": tf.location.x, "y": tf.location.y, "z": tf.location.z},
-                    "rotation": {"pitch": tf.rotation.pitch, "yaw": tf.rotation.yaw, "roll": tf.rotation.roll},
-                    "speed_kmh": spd_kmh,
-                    "control": {
-                        "throttle": ctrl.throttle, "steer": ctrl.steer, "brake": ctrl.brake,
-                        "reverse": ctrl.reverse, "hand_brake": ctrl.hand_brake,
-                        "manual_gear_shift": ctrl.manual_gear_shift, "gear": ctrl.gear,
-                    },
-                    "image_path": f"images/{frame:06d}.png",
-                    "mode": args.mode,
-                    "town": Path(world.get_map().name).name,
-                }
-                meas_f.write(json.dumps(rec) + "\n")
-
                 steps_done += 1
-            else:
-                # when paused, skip waiting and skip logging (and don't count a step)
-                pass
+
     finally:
         # 1. Stop sensors and ego autopilot
         camera.stop()

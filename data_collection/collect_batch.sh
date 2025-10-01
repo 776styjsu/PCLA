@@ -55,9 +55,9 @@ while getopts ":hn:s:f:o:r" opt; do
   esac
 done
 
-# Town list (excluding *_Opt variants that may cause segfaults)
+# Town list (excluding *_Opt variants and Town15 that may cause crash)
 MAPS=("Town01" "Town02" "Town03" "Town04" "Town05" "Town06" "Town07" \
-      "Town10HD" "Town11" "Town12" "Town13" "Town15")
+      "Town10HD" "Town11" "Town12" "Town13")
 
 ALL_TOWNS=$(IFS=, ; echo "${MAPS[*]}")
 
