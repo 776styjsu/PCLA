@@ -4,14 +4,18 @@
 set -e
 set -o pipefail
 
-USAGE_STRING="usage: collect_batch.sh [-h] [-n steps] [-s fps] [-f path/to/Carla.sh] [-o path/to/output] [-r]
+SOURCE="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+USAGE_STRING="usage: collect_batch.sh [-h] [-n steps] [-s fps] [-f path/to/Carla.sh] [-o path/to/output] [-t Town01,Town02,...] [-r]
   -h    Displays this help message.
   -n N  Number of steps for data collection for each map
   -s N  Frames per second for data collection
   -f N  Path to CARLA script
   -o N  Output directory name
+  -t    Comma-separated list of towns (e.g., Town01,Town02,Town10HD)
   -r    Restart CARLA for each map
-  Example: collect_batch.sh -n 1200 -s 10 -f ../../carla-0.9.15/CarlaUE4.sh -o out"
+  Example: collect_batch.sh -n 1200 -s 10 -f ../../carla-0.9.15/CarlaUE4.sh -o out -t Town01,Town02"
 
 # Default values
 STEPS=1200
@@ -19,9 +23,10 @@ FPS=10
 OUTPUT_DIR="out_autopilot"
 restart=false
 CARLA_PATH=""
+TOWNS=""
 
 # Parse command-line arguments
-while getopts ":hn:s:f:o:r" opt; do
+while getopts ":hn:s:f:o:t:r" opt; do
   case ${opt} in
     h)
       echo "$USAGE_STRING"
@@ -39,6 +44,9 @@ while getopts ":hn:s:f:o:r" opt; do
     o)
       OUTPUT_DIR="$OPTARG"
       ;;
+    t)
+      TOWNS="$OPTARG"
+      ;;
     r)
       restart=true
       ;;
@@ -55,13 +63,23 @@ while getopts ":hn:s:f:o:r" opt; do
   esac
 done
 
-# Town list (excluding *_Opt variants and Town15 that may cause crash)
-MAPS=("Town01" "Town02" "Town03" "Town04" "Town05" "Town06" "Town07" \
-      "Town10HD" "Town11" "Town12" "Town13")
+# Default town list (excluding *_Opt variants and Town15 which may be unstable)
+DEFAULT_MAPS=("Town01" "Town02" "Town03" "Town04" "Town05" "Town06" "Town07" \
+              "Town10HD" "Town11" "Town12" "Town13")
 
-ALL_TOWNS=$(IFS=, ; echo "${MAPS[*]}")
+# Resolve MAPS (array) and TOWNS (comma-joined string)
+if [[ -z "$TOWNS" ]]; then
+  MAPS=("${DEFAULT_MAPS[@]}")
+  TOWNS=$(IFS=, ; echo "${MAPS[*]}")
+else
+  IFS=',' read -r -a MAPS <<< "$TOWNS"
+fi
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+AUTOPILOT_PY="$SCRIPT_DIR/collect_with_autopilot.py"
+
+# Ensure output dir base exists
+mkdir -p "$OUTPUT_DIR"
 
 if $restart; then
   if [[ -z "$CARLA_PATH" ]]; then
@@ -72,7 +90,7 @@ if $restart; then
   for map in "${MAPS[@]}"; do
     echo "Running script on $map"
     run_dir="${map}-${TIMESTAMP}"
-    python collect_with_autopilot.py \
+    python "$AUTOPILOT_PY" \
       --town="$map" \
       --steps="$STEPS" \
       --fps="$FPS" \
@@ -82,8 +100,9 @@ if $restart; then
   done
 else
   run_dir="all-${TIMESTAMP}"
-  python collect_with_autopilot.py \
-    --towns="$ALL_TOWNS" \
+  echo "Running script on towns: $TOWNS"
+  python "$AUTOPILOT_PY" \
+    --towns="$TOWNS" \
     --steps="$STEPS" \
     --fps="$FPS" \
     --out="$OUTPUT_DIR/${run_dir}"

@@ -61,8 +61,6 @@ def load_steers(jsonl_path: Path, args: argparse.Namespace) -> List[float]:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                # print(f"{args.recording_only}, {obj.get('recording')}")
-                print(obj)
                 if args.recording_only and obj.get("recording", False):
                     continue
                 s = obj.get("control", {}).get("steer")

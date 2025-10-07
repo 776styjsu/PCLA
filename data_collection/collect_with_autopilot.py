@@ -115,6 +115,17 @@ def ensure_dir(p): Path(p).mkdir(parents=True, exist_ok=True)
 def normalize_map_name(m):  # "/Game/Carla/Maps/Town03" -> "Town03"
     return Path(m).name
 
+def disable_red_lights(world):
+    # Stop the signal timers so nothing changes while we edit.
+    world.freeze_all_traffic_lights(True)
+
+    # Turn every light Off (no red glow in renders) and neuter timers.
+    for tl in world.get_actors().filter("traffic.traffic_light"):
+        tl.set_state(carla.TrafficLightState.Green)   # or TrafficLightState.Green
+        tl.set_red_time(0.0)
+        tl.set_yellow_time(0.0)
+        tl.set_green_time(1e6)
+
 def spawn_ego(world, bp_lib):
     veh_bp = bp_lib.find("vehicle.tesla.model3")
     veh_bp.set_attribute("role_name", "hero")
@@ -196,11 +207,16 @@ def collect_once_on_world(client, tm, args, out_dir):
     agent = None
     if args.mode == "tm":
         ego.set_autopilot(True, tm.get_port())
-    else:
+    elif args.mode == "basic":
+        from agents.navigation.basic_agent import BasicAgent
+        agent = BasicAgent(ego)
+        dest = random.choice(world.get_map().get_spawn_points()).location
+        agent.set_destination(dest)
+    elif args.mode == "behavior":
         from agents.navigation.behavior_agent import BehaviorAgent
         agent = BehaviorAgent(ego, behavior="normal")
         dest = random.choice(world.get_map().get_spawn_points()).location
-        agent.set_destination(agent._vehicle.get_location(), dest)
+        agent.set_destination(dest)
 
     meas_path = os.path.join(out_dir, "measurements.jsonl")
     meas_f = open(meas_path, "w", buffering=1)
@@ -292,12 +308,12 @@ def collect_once_on_world(client, tm, args, out_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["tm","behavior"], default="tm")
+    parser.add_argument("--mode", choices=["tm","basic", "behavior"], default="tm")
     parser.add_argument("--out", default="out_autopilot")
     parser.add_argument("--steps", type=int, default=1200)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--port", type=int, default=2000)
-    parser.add_argument("--tm-port", type=int, default=20500)
+    parser.add_argument("--tm-port", type=int, default=8000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-npcs", type=int, default=40)
     parser.add_argument("--rgb-width", type=int, default=1280)
@@ -305,8 +321,12 @@ def main():
     parser.add_argument("--town", default=None, help="Run only on this town")
     parser.add_argument("--towns", default=None, help="Comma-separated list of towns (e.g., Town01,Town03)")
     parser.add_argument("--all-towns", action="store_true", help="Run on every installed map")
+    parser.add_argument("--no-red-light", action="store_true", help="Traffic light always green")
     parser.add_argument("--min-speed-kmh", type=float, default=3.0,
                         help="Only record when ego speed >= this (km/h)")
+    # TODO: max_speed_kmh not used yet
+    parser.add_argument("--max-speed-kmh", type=float, default=None,
+                        help="Enforce speed limit on vehicle control when in traffic manager mode")
     parser.add_argument("--stall-patience", type=int, default=5,
                         help="Consecutive slow frames before pausing recording")
     parser.add_argument("--start-carla", action="store_true", help="Start CARLA on run")
@@ -357,6 +377,9 @@ def main():
             world = client.load_world(town)
             time.sleep(10.0)
             world.tick()
+
+            if args.no_red_light:
+                disable_red_lights(world)
 
             # Per-town output folder
             town_out = os.path.join(root_out, town)
