@@ -312,12 +312,12 @@ def main():
     parser.add_argument("--towns", default=None, help="Comma-separated list of towns (e.g., Town01,Town03)")
     parser.add_argument("--all-towns", action="store_true", help="Run on every installed map")
     parser.add_argument("--no-red-light", action="store_true", help="Traffic light always green")
-    parser.add_argument("--min-speed-kmh", type=float, default=3.0,
+    parser.add_argument("--min-speed-kmh", type=float, default=1.0,
                         help="Only record when ego speed >= this (km/h)")
     # TODO: max_speed_kmh not used yet
     parser.add_argument("--max-speed-kmh", type=float, default=None,
                         help="Enforce speed limit on vehicle control when in traffic manager mode")
-    parser.add_argument("--stall-patience", type=int, default=5,
+    parser.add_argument("--stall-patience", type=int, default=1e6,
                         help="Consecutive slow frames before pausing recording")
     parser.add_argument("--start-carla", action="store_true", help="Start CARLA on run")
     parser.add_argument("--restart-carla", action="store_true", help="Restart CARLA on run")
