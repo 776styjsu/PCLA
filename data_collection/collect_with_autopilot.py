@@ -178,9 +178,6 @@ def collect_once_on_world(client, tm, args, out_dir):
     """Runs one data-collection episode on the CURRENT world."""
     world = client.get_world()
 
-    # Touch topology once (forces map/nav data to be resident)
-    _ = world.get_map().get_topology()
-
     # sync sim
     settings = world.get_settings()
     settings.synchronous_mode = True
@@ -210,13 +207,9 @@ def collect_once_on_world(client, tm, args, out_dir):
     elif args.mode == "basic":
         from agents.navigation.basic_agent import BasicAgent
         agent = BasicAgent(ego)
-        dest = random.choice(world.get_map().get_spawn_points()).location
-        agent.set_destination(dest)
     elif args.mode == "behavior":
         from agents.navigation.behavior_agent import BehaviorAgent
         agent = BehaviorAgent(ego, behavior="normal")
-        dest = random.choice(world.get_map().get_spawn_points()).location
-        agent.set_destination(dest)
 
     meas_path = os.path.join(out_dir, "measurements.jsonl")
     meas_f = open(meas_path, "w", buffering=1)
@@ -233,9 +226,6 @@ def collect_once_on_world(client, tm, args, out_dir):
 
         while steps_done < args.steps and ticks_seen < TICK_CAP:
             if agent is not None:
-                if agent.done():
-                    dest = random.choice(world.get_map().get_spawn_points()).location
-                    agent.set_destination(agent._vehicle.get_location(), dest)
                 control = agent.run_step()
                 ego.apply_control(control)
 
