@@ -129,8 +129,10 @@ def disable_red_lights(world):
 def spawn_ego(world, bp_lib):
     veh_bp = bp_lib.find("vehicle.tesla.model3")
     veh_bp.set_attribute("role_name", "hero")
-    spawn = random.choice(world.get_map().get_spawn_points())
-    return world.spawn_actor(veh_bp, spawn)
+    spawn_point_id = random.randint(0, len(world.get_map().get_spawn_points()) - 1)
+    print(f"Spawning ego at sp {spawn_point_id}")
+    spawn = world.get_map().get_spawn_points()[spawn_point_id]
+    return world.spawn_actor(veh_bp, spawn), spawn_point_id
 
 def attach_front_rgb(world, bp_lib, parent, out_dir, width, height, fov=90):
     cam_bp = bp_lib.find("sensor.camera.rgb")
@@ -174,6 +176,20 @@ def spawn_npcs(world, bp_lib, tm, n=40):
             pass
     return actors
 
+def plan_random_route(agent, grp, spawn_point_id):
+    spawn_points = agent._world.get_map().get_spawn_points()
+    random_dest_id = random.randint(0, len(spawn_points) - 1)
+    print(f"Planning new route from sp {spawn_point_id} to sp {random_dest_id}")
+    # Avoid picking the same point
+    while random_dest_id == spawn_point_id:
+        random_dest_id = random.randint(0, len(spawn_points) - 1)
+    src = spawn_points[spawn_point_id].location
+    dst = spawn_points[random_dest_id].location
+    route = grp.trace_route(src, dst)
+    agent.set_global_plan(route)
+    print(f"New route: {src} -> {dst}, {len(route)} waypoints")
+    return random_dest_id
+
 def collect_once_on_world(client, tm, args, out_dir):
     """Runs one data-collection episode on the CURRENT world."""
     world = client.get_world()
@@ -187,7 +203,7 @@ def collect_once_on_world(client, tm, args, out_dir):
     bp_lib = world.get_blueprint_library()
     
     # ego + camera
-    ego = spawn_ego(world, bp_lib)
+    ego, spawn_point_id = spawn_ego(world, bp_lib)
     camera, img_queue, set_recording = attach_front_rgb(
         world,
         bp_lib,
@@ -211,6 +227,11 @@ def collect_once_on_world(client, tm, args, out_dir):
         from agents.navigation.behavior_agent import BehaviorAgent
         agent = BehaviorAgent(ego, behavior="normal")
 
+    if agent is not None:
+        from agents.navigation.global_route_planner import GlobalRoutePlanner
+        grp = GlobalRoutePlanner(world.get_map(), 2.0)
+        dest_id = plan_random_route(agent, grp, spawn_point_id)
+        
     meas_path = os.path.join(out_dir, "measurements.jsonl")
     meas_f = open(meas_path, "w", buffering=1)
 
@@ -226,6 +247,9 @@ def collect_once_on_world(client, tm, args, out_dir):
 
         while steps_done < args.steps and ticks_seen < TICK_CAP:
             if agent is not None:
+                # Replan route if current destination is reached
+                if agent.done():
+                    dest_id = plan_random_route(agent, grp, dest_id)
                 control = agent.run_step()
                 ego.apply_control(control)
 
