@@ -322,7 +322,7 @@ def collect_once_on_world(client, tm, args, out_dir):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["tm","basic", "behavior"], default="tm")
+    parser.add_argument("--mode", choices=["tm","basic", "behavior"], default="basic")
     parser.add_argument("--out", default="out_autopilot")
     parser.add_argument("--steps", type=int, default=1200)
     parser.add_argument("--fps", type=int, default=10)
