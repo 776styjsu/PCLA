@@ -20,6 +20,7 @@ USAGE_STRING="usage: collect_batch.sh [-h] [-m mode] [-n steps] [-s fps] [-c] [-
   Example: collect_batch.sh -n 1200 -s 10 -f ../../carla-0.9.15/CarlaUE4.sh -o out -t Town01,Town02"
 
 # Default values
+MODE="basic"
 STEPS=1200
 FPS=10
 N_NPCS=40
