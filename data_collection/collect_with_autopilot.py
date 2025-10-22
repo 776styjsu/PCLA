@@ -153,7 +153,7 @@ def attach_front_rgb(world, bp_lib, parent, out_dir, width, height, fov=90):
 
     def _on_img(img):
         # only save/queue when recording
-        img.save_to_disk(os.path.join(img_dir, f"{img.frame:06d}.png"))
+        img.save_to_disk(os.path.join(img_dir, f"{Path(world.get_map().name).name}_{img.frame:06d}.png"))
         q.append(img.frame)
 
     camera.listen(_on_img)
@@ -187,8 +187,47 @@ def plan_random_route(agent, grp, spawn_point_id):
     dst = spawn_points[random_dest_id].location
     route = grp.trace_route(src, dst)
     agent.set_global_plan(route)
-    print(f"New route: {src} -> {dst}, {len(route)} waypoints")
     return random_dest_id
+
+def teleport_ego_to_random_spawn(world, ego, exclude_id=None):
+    """
+    Safely teleport the ego to a random spawn point (different from exclude_id if given),
+    resetting its linear/angular velocity to avoid physics explosions.
+    Returns the new spawn_point_id.
+    """
+    spawn_points = world.get_map().get_spawn_points()
+    if not spawn_points:
+        raise RuntimeError("No spawn points found in map")
+
+    new_id = random.randrange(len(spawn_points))
+    if exclude_id is not None and len(spawn_points) > 1:
+        while new_id == exclude_id:
+            new_id = random.randrange(len(spawn_points))
+
+    new_tf = spawn_points[new_id]
+
+    # Temporarily disable physics, move, then re-enable + zero velocities.
+    try:
+        ego.set_simulate_physics(False)
+    except RuntimeError:
+        pass
+
+    ego.set_transform(new_tf)
+    try:
+        ego.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        ego.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+    except RuntimeError:
+        pass
+
+    try:
+        ego.set_simulate_physics(True)
+    except RuntimeError:
+        pass
+
+    # Let the world settle the teleport
+    world.tick()
+    world.tick()
+    return new_id
 
 def collect_once_on_world(client, tm, args, out_dir):
     """Runs one data-collection episode on the CURRENT world."""
@@ -228,6 +267,9 @@ def collect_once_on_world(client, tm, args, out_dir):
         agent = BehaviorAgent(ego, behavior="normal")
 
     if agent is not None:
+        # Set ego target speed
+        agent.set_target_speed(args.target_speed_kmh)
+
         from agents.navigation.global_route_planner import GlobalRoutePlanner
         grp = GlobalRoutePlanner(world.get_map(), 2.0)
         dest_id = plan_random_route(agent, grp, spawn_point_id)
@@ -267,6 +309,34 @@ def collect_once_on_world(client, tm, args, out_dir):
             else:
                 stall_timer = 0
 
+            # If user asked to respawn on stall and we hit patience threshold, do it.
+            if args.respawn_on_stall and stall_timer >= args.stall_patience:
+                prev_spawn = spawn_point_id
+                print(f"[stall] Respawning/teleporting ego after {stall_timer} slow ticks "
+                      f"(speed={spd_kmh:.2f} km/h).", flush=True)
+
+                # Teleport the current ego (camera stays attached) and reset route
+                spawn_point_id = teleport_ego_to_random_spawn(world, ego, exclude_id=prev_spawn)
+
+                # Replan agent route from the *new* spawn origin
+                if agent is not None:
+                    dest_id = plan_random_route(agent, grp, spawn_point_id)
+
+                # Reset stall + resume recording right away
+                stall_timer = 0
+                recording = True
+                set_recording(True)
+
+                # Optionally log an event for later analysis
+                resp_evt = {
+                    "event": "respawn_teleport",
+                    "frame": frame,
+                    "from_spawn_id": int(prev_spawn),
+                    "to_spawn_id": int(spawn_point_id),
+                    "town": Path(world.get_map().name).name
+                }
+                meas_f.write(json.dumps(resp_evt) + "\n")
+
             should_record = (stall_timer < args.stall_patience)
             if should_record != recording:
                 recording = should_record
@@ -288,7 +358,7 @@ def collect_once_on_world(client, tm, args, out_dir):
                     "reverse": ctrl.reverse, "hand_brake": ctrl.hand_brake,
                     "manual_gear_shift": ctrl.manual_gear_shift, "gear": ctrl.gear,
                 },
-                "image_path": f"images/{frame:06d}.png",
+                "image_path": f"images/{Path(world.get_map().name).name}_{frame:06d}.png",
                 "mode": args.mode,
                 "town": Path(world.get_map().name).name,
                 "recording": recording
@@ -338,11 +408,11 @@ def main():
     parser.add_argument("--no-red-light", action="store_true", help="Traffic light always green")
     parser.add_argument("--min-speed-kmh", type=float, default=1.0,
                         help="Only record when ego speed >= this (km/h)")
-    # TODO: max_speed_kmh not used yet
-    parser.add_argument("--max-speed-kmh", type=float, default=None,
-                        help="Enforce speed limit on vehicle control when in traffic manager mode")
+    parser.add_argument("--target-speed-kmh", type=float, default=20,
+                        help="Set target speed for ego vehicle control when in agent mode")
     parser.add_argument("--stall-patience", type=int, default=1e6,
                         help="Consecutive slow frames before pausing recording")
+    parser.add_argument("--respawn-on-stall", action="store_true", help="Respawn ego vehicle to a random location when the vehicle is stalled")
     parser.add_argument("--start-carla", action="store_true", help="Start CARLA on run")
     parser.add_argument("--restart-carla", action="store_true", help="Restart CARLA on run")
     parser.add_argument("--gpu", type=bool, default=True, help="Use GPU to run CARLA")

@@ -1,4 +1,4 @@
-# train/train.py
+# train/train_dave2.py
 import glob
 import json
 import math
@@ -14,7 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Compose, ToTensor, Resize, Normalize
 from PIL import Image
 
-from models.dave2 import DAVE2v1
+from models.dave2velocity import DAVE2v1Velocity
 
 
 def _p(msg: str) -> None:
@@ -28,7 +28,7 @@ class CarlaSteerDataset(Dataset):
       {
         "image_path": "relative/or/absolute/path/to/frame.png",
         "steer": float_in_-1..1,
-        # "control": {"steer": ...} is also supported
+        "speed_kmh": float            # optional but recommended if conditioning on speed
       }
     If your logs store image file names relative to a root, set img_root.
     """
@@ -67,13 +67,16 @@ class CarlaSteerDataset(Dataset):
         if "control" in r and "steer" in r["control"]:
             steer = float(r["control"]["steer"])
         else:
-            steer = float(r["steer"])  # if your JSONL has a flat key
+            steer = float(r["steer"])  # if your JSONL ever has a flat key
 
-        # ensure in [-1, 1] (CARLA already is)
+        # ensure in [-1, 1] if needed (CARLA is already [-1,1], so this is a no-op)
         steer = max(-1.0, min(1.0, steer))
         y = torch.tensor([steer], dtype=torch.float32)
 
-        return x, y
+        # speed (already km/h)
+        s = torch.tensor([float(r.get("speed_kmh", 0.0))], dtype=torch.float32)
+
+        return x, y, s
 
 
 def expand_jsonl_args(paths: List[str]) -> List[Path]:
@@ -114,18 +117,18 @@ def train_one_epoch(model, loader, opt, loss_fn, device="cuda", amp=False, scale
     # Print roughly 10 times per epoch (or every 100 batches at most)
     interval = max(1, min(100, num_batches // 10))
 
-    for i, (x, y) in enumerate(loader):
-        x, y = x.to(device), y.to(device)
+    for i, (x, y, s) in enumerate(loader):
+        x, y, s = x.to(device), y.to(device), s.to(device)
         opt.zero_grad(set_to_none=True)
         if amp and scaler is not None:
             with torch.cuda.amp.autocast():
-                yhat = model(x)
+                yhat = model(x, speed=s)
                 loss = loss_fn(yhat, y)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
         else:
-            yhat = model(x)
+            yhat = model(x, speed=s)
             loss = loss_fn(yhat, y)
             loss.backward()
             opt.step()
@@ -134,7 +137,7 @@ def train_one_epoch(model, loader, opt, loss_fn, device="cuda", amp=False, scale
         total += float(loss) * bs
         n += bs
 
-        # --- batch heartbeat ---
+        # --- ADDED LOGGING: batch heartbeat ---
         if (i + 1) % interval == 0 or (i + 1) == num_batches:
             elapsed = time.time() - start
             fps = n / elapsed if elapsed > 0 else float("inf")
@@ -153,9 +156,9 @@ def evaluate(model, loader, loss_fn, device="cuda", epoch=0):
     total = 0.0
     n = 0
     start = time.time()
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        yhat = model(x)
+    for x, y, s in loader:
+        x, y, s = x.to(device), y.to(device), s.to(device)
+        yhat = model(x, speed=s)
         loss = loss_fn(yhat, y)
         total += float(loss) * x.size(0)
         n += x.size(0)
@@ -187,6 +190,13 @@ if __name__ == "__main__":
     parser.add_argument("--height", type=int, default=180)
     parser.add_argument("--width", type=int, default=320)
 
+    # speed conditioning
+    parser.add_argument("--use_speed", action="store_true", help="Condition on speed_kmh")
+    parser.add_argument("--speed_norm", choices=["divide", "standardize"], default="divide",
+                        help="How to normalize speed: divide by a constant or dataset standardization")
+    parser.add_argument("--speed_scale", type=float, default=120.0,
+                        help="Divisor for km/h if --speed_norm=divide (e.g., 120 km/h)")
+
     # dataloader & reproducibility
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--val_workers", type=int, default=2)
@@ -210,31 +220,50 @@ if __name__ == "__main__":
     _p(f"train_files={len(train_paths)}  val_files={len(val_paths)}")
     if args.img_root:
         _p(f"img_root={args.img_root}")
+    if args.use_speed:
+        _p(f"use_speed=True  speed_norm={args.speed_norm}  "
+           f"{'speed_scale='+str(args.speed_scale) if args.speed_norm=='divide' else ''}")
     _p(f"workers(train/val)=({args.workers}/{args.val_workers})")
     _p(f"checkpoint_out={args.out}")
     _p("===================")
 
     train_ds = CarlaSteerDataset(train_paths,
-                                 img_root=Path(args.img_root) if args.img_root else None,
-                                 resize=(args.height, args.width))
+                             img_root=Path(args.img_root) if args.img_root else None,
+                             resize=(args.height, args.width))
 
     val_ds = (CarlaSteerDataset(val_paths,
                                 img_root=Path(args.img_root) if args.img_root else None,
                                 resize=(args.height, args.width))
-              if val_paths else None)
+            if val_paths else None)
 
     _p(f"train_samples={len(train_ds)}  val_samples={0 if val_ds is None else len(val_ds)}")
 
     pw_train = args.workers > 0
     pw_val = args.val_workers > 0
     train_ld = DataLoader(train_ds, batch_size=args.bs, shuffle=True,
-                          num_workers=args.workers, pin_memory=(device=="cuda"), persistent_workers=pw_train)
+                          num_workers=args.workers, pin_memory=True, persistent_workers=pw_train)
     val_ld = (DataLoader(val_ds, batch_size=args.bs, shuffle=False,
-                         num_workers=args.val_workers, pin_memory=(device=="cuda"), persistent_workers=pw_val)
+                         num_workers=args.val_workers, pin_memory=True, persistent_workers=pw_val)
               if val_ds else None)
 
-    # Model (no speed)
-    model = DAVE2v1(input_shape=(args.height, args.width)).to(device)
+    # Model
+    model = DAVE2v1Velocity(input_shape=(args.height, args.width),
+                    use_speed=args.use_speed,
+                    speed_norm=args.speed_norm,
+                    speed_scale=args.speed_scale).to(device)
+
+    # If using standardization, compute dataset mean/std of speed and set buffers
+    if args.use_speed and args.speed_norm == "standardize":
+        speeds = [float(s.get("speed_kmh", 0.0)) for s in train_ds.samples]
+        if len(speeds) == 0:
+            mean, std = 0.0, 1.0
+        else:
+            mean = float(np.mean(speeds))
+            std = float(np.std(speeds)) if float(np.std(speeds)) > 1e-6 else 1.0
+        # registered buffers live on the model; keep them as scalars
+        model.speed_mean.fill_(mean)
+        model.speed_std.fill_(std)
+        _p(f"[speed standardize] mean={mean:.3f} std={std:.3f}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     loss_fn = nn.MSELoss()
@@ -272,6 +301,9 @@ if __name__ == "__main__":
                 "optimizer": opt.state_dict(),
                 "meta": {
                     "input_shape": (args.height, args.width),
+                    "use_speed": args.use_speed,
+                    "speed_norm": args.speed_norm,
+                    "speed_scale": args.speed_scale,
                     "epoch": ep,
                     "device": device,
                 }
@@ -287,6 +319,9 @@ if __name__ == "__main__":
             "optimizer": opt.state_dict(),
             "meta": {
                 "input_shape": (args.height, args.width),
+                "use_speed": args.use_speed,
+                "speed_norm": args.speed_norm,
+                "speed_scale": args.speed_scale,
                 "epoch": args.epochs,
                 "device": device,
             }
