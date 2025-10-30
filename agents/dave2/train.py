@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Compose, ToTensor, Resize, Normalize
-from PIL import Image
+from PIL import Image, ImageFile
 
 from models.dave2 import DAVE2v1
 
@@ -22,59 +22,93 @@ def _p(msg: str) -> None:
     print(msg, flush=True)
 
 
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 class CarlaSteerDataset(Dataset):
     """
     Expects a list of JSONL files where each line has (at least):
-      {
-        "image_path": "relative/or/absolute/path/to/frame.png",
-        "steer": float_in_-1..1,
-        # "control": {"steer": ...} is also supported
-      }
+      { "image_path": "...", "steer": float, or "control": {"steer": ...} }
     If your logs store image file names relative to a root, set img_root.
     """
 
-    def __init__(self, jsonl_files: List[Path], img_root: Path = None, resize=(150, 200)):
+    def __init__(self, jsonl_files: List[Path], img_root: Path = None, resize=(150, 200),
+                 prefilter_missing: bool = True):
         self.samples: List[Dict] = []
+        self.img_root = img_root
+        self.tf = Compose([
+            Resize(resize),
+            ToTensor(),
+            Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+
+        n_total = 0
+        n_kept = 0
         for f in jsonl_files:
             with open(f, "r") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
                         continue
-                    self.samples.append(json.loads(line))
-        self.img_root = img_root
-        self.tf = Compose([
-            Resize(resize),                        # (H,W) -> must match model's input_shape
-            ToTensor(),                            # [0,1]
-            Normalize(mean=[0.5, 0.5, 0.5],
-                      std=[0.5, 0.5, 0.5])          # ~[-1,1]
-        ])
+                    n_total += 1
+                    rec = json.loads(line)
+
+                    # Resolve path and (optionally) prefilter if it doesn't exist
+                    p = self._resolve_path(rec.get("image_path", ""))
+                    if prefilter_missing:
+                        if p is None or not p.exists():
+                            continue
+                    self.samples.append(rec)
+                    n_kept += 1
+
+        if prefilter_missing:
+            _p(f"[CarlaSteerDataset] loaded records: {n_kept}/{n_total} kept "
+               f"(dropped {n_total - n_kept} missing paths)")
+
+    def _resolve_path(self, path_str: str) -> Path:
+        if not path_str:
+            return None
+        p = Path(path_str)
+        if self.img_root is not None and not p.is_absolute():
+            p = self.img_root / p
+        return p
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        # Return None on any load error; collate_fn will drop it.
         r = self.samples[idx]
+        try:
+            # image path
+            p = self._resolve_path(r["image_path"])
+            if p is None or not p.exists():
+                return None  # missing file => skip
 
-        # image path
-        p = Path(r["image_path"])
-        if self.img_root is not None and not p.is_absolute():
-            p = self.img_root / p
-        img = Image.open(p).convert("RGB")
-        x = self.tf(img)  # [3,H,W]
+            with Image.open(p) as im:
+                img = im.convert("RGB")
+            x = self.tf(img)  # [3,H,W]
 
-        # steering: control.steer (fallback to top-level "steer" if present)
-        if "control" in r and "steer" in r["control"]:
-            steer = float(r["control"]["steer"])
-        else:
-            steer = float(r["steer"])  # if your JSONL has a flat key
+            # steering: control.steer (fallback to top-level "steer")
+            if "control" in r and "steer" in r["control"]:
+                steer = float(r["control"]["steer"])
+            else:
+                steer = float(r["steer"])
 
-        # ensure in [-1, 1] (CARLA already is)
-        steer = max(-1.0, min(1.0, steer))
-        y = torch.tensor([steer], dtype=torch.float32)
+            steer = max(-1.0, min(1.0, steer))
+            y = torch.tensor([steer], dtype=torch.float32)
+            return x, y
 
-        return x, y
+        except Exception:
+            # Any problem (file missing, unreadable, bad JSON fields, etc.) => skip
+            return None
 
+def collate_skip_missing(batch):
+    """Filter out None samples produced by the Dataset on load errors."""
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None  # training loop will skip this batch
+    xs, ys = zip(*batch)
+    return torch.stack(xs, 0), torch.stack(ys, 0)
 
 def expand_jsonl_args(paths: List[str]) -> List[Path]:
     out: List[Path] = []
@@ -111,10 +145,15 @@ def train_one_epoch(model, loader, opt, loss_fn, device="cuda", amp=False, scale
     start = time.time()
 
     num_batches = len(loader)
-    # Print roughly 10 times per epoch (or every 100 batches at most)
     interval = max(1, min(100, num_batches // 10))
 
-    for i, (x, y) in enumerate(loader):
+    for i, batch in enumerate(loader):
+        if batch is None:          # all items in this batch were bad => skip
+            continue
+        x, y = batch
+        if x.numel() == 0:         # paranoia guard
+            continue
+
         x, y = x.to(device), y.to(device)
         opt.zero_grad(set_to_none=True)
         if amp and scaler is not None:
@@ -134,7 +173,6 @@ def train_one_epoch(model, loader, opt, loss_fn, device="cuda", amp=False, scale
         total += float(loss) * bs
         n += bs
 
-        # --- batch heartbeat ---
         if (i + 1) % interval == 0 or (i + 1) == num_batches:
             elapsed = time.time() - start
             fps = n / elapsed if elapsed > 0 else float("inf")
@@ -153,7 +191,12 @@ def evaluate(model, loader, loss_fn, device="cuda", epoch=0):
     total = 0.0
     n = 0
     start = time.time()
-    for x, y in loader:
+    for batch in loader:
+        if batch is None:
+            continue
+        x, y = batch
+        if x.numel() == 0:
+            continue
         x, y = x.to(device), y.to(device)
         yhat = model(x)
         loss = loss_fn(yhat, y)
@@ -162,7 +205,6 @@ def evaluate(model, loader, loss_fn, device="cuda", epoch=0):
     elapsed = time.time() - start
     _p(f"[epoch {epoch:02d}] validation done in {elapsed:.2f}s")
     return total / max(1, n)
-
 
 def _set_seeds(seed: int, device: str):
     import random
@@ -228,9 +270,9 @@ if __name__ == "__main__":
     pw_train = args.workers > 0
     pw_val = args.val_workers > 0
     train_ld = DataLoader(train_ds, batch_size=args.bs, shuffle=True,
-                          num_workers=args.workers, pin_memory=(device=="cuda"), persistent_workers=pw_train)
+                          num_workers=args.workers, pin_memory=(device=="cuda"), persistent_workers=pw_train, collate_fn=collate_skip_missing)
     val_ld = (DataLoader(val_ds, batch_size=args.bs, shuffle=False,
-                         num_workers=args.val_workers, pin_memory=(device=="cuda"), persistent_workers=pw_val)
+                         num_workers=args.val_workers, pin_memory=(device=="cuda"), persistent_workers=pw_val, collate_fn=collate_skip_missing)
               if val_ds else None)
 
     # Model (no speed)
