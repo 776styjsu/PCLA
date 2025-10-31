@@ -111,7 +111,7 @@ def main():
     parser.add_argument("--town", default="Town04", help="Town01..Town10 (or any installed map)")
     parser.add_argument("--ckpt", required=True, help="Path to DAVE2 checkpoint (state dict with ['model'])")
     parser.add_argument("--target-kmh", type=float, default=20.0)
-    parser.add_argument("--fps", type=float, default=10.0, help="Simulation fixed step (Hz)")
+    parser.add_argument("--fps", type=float, default=30.0, help="Simulation fixed step (Hz)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seconds", type=int, default=300, help="How long to drive before quitting")
     parser.add_argument("--out", default=None, help="Dir to save logs (JSONL) and frames")
@@ -151,7 +151,6 @@ def main():
     settings = world.get_settings()
     settings.synchronous_mode = True
     settings.fixed_delta_seconds = 1.0 / args.fps
-    settings.max_substeps = 1
     world.apply_settings(settings)
     sim_fps = 1.0 / settings.fixed_delta_seconds  # authoritative FPS for encoding
 
@@ -171,6 +170,10 @@ def main():
     ffmpeg_proc = None
     ffmpeg_path_actual = None
     # ---------------------------
+
+    frames_processed = 0
+    video_frames_written = 0
+    ffmpeg_frames_sent = 0
 
     actors_to_destroy = []
 
@@ -217,18 +220,21 @@ def main():
                 f"sim_fps={sim_fps}\n"
             )
 
-        # Let physics settle a frame
-        snapshot = world.tick()
+        # Let physics settle a frame and record baseline sim time
+        world.tick()
+        start_elapsed = world.get_snapshot().timestamp.elapsed_seconds
 
-        start_time = time.time()
         steps = 0
         print(f"[INFO] Driving in {args.town} at target {args.target_kmh:.1f} km/h ... Ctrl+C to stop.")
 
         while True:
             # Advance exactly one sim tick and fetch the matching camera frame
-            snapshot = world.tick()
-            img = get_image_for_frame(image_queue, snapshot)
+            frame_id = world.tick()
+            snapshot = world.get_snapshot()
+            img = get_image_for_frame(image_queue, frame_id)
             pil = carla_img_to_pil(img)
+            sim_time = max(0.0, snapshot.timestamp.elapsed_seconds - start_elapsed)
+            frames_processed += 1
 
             # Longitudinal control (hold speed)
             kmh = speed_kmh(ego)
@@ -286,6 +292,7 @@ def main():
                         f"Frame size changed from {(video_w, video_h)} to {(w, h)}; all frames must be identical."
                     )
                 video_writer.write(bgr)
+                video_frames_written += 1
 
             # --- ffmpeg pipe (CFR = sim_fps) ---
             if args.ffmpeg and ffmpeg_proc is None:
@@ -325,6 +332,7 @@ def main():
 
             if ffmpeg_proc is not None and ffmpeg_proc.stdin:
                 ffmpeg_proc.stdin.write(bgr.tobytes())
+                ffmpeg_frames_sent += 1
 
             # Optional per-frame PNG save
             if args.save_frames and out is not None:
@@ -358,7 +366,7 @@ def main():
                     )
                 )
 
-            if (time.time() - start_time) > args.seconds:
+            if sim_time >= args.seconds:
                 print("[INFO] Time limit reached, stopping.")
                 break
 
