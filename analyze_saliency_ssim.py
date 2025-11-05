@@ -8,7 +8,8 @@ Skip the next K frames after any respawn event. Optionally compute SSIM over the
 original image pairs and plot trend/relationship figures.
 
 Output CSV columns:
-  town, prev_frame, curr_frame, prev_path, curr_path, ssim, image_ssim, steer_sim, note
+    town, prev_frame, curr_frame, prev_path, curr_path, prev_img_path, curr_img_path,
+    ssim, image_ssim, steer_sim, note
 """
 
 import argparse
@@ -286,16 +287,15 @@ def main():
             skipped_singleton += 1
             continue
 
-        # Preload saliency paths for this town
+        # Preload paths/metadata for this town
         sal_paths: Dict[int, Optional[Path]] = {}
-        img_paths: Dict[int, Optional[Path]] = {}
+        img_paths: Dict[int, Path] = {}
         steer_map: Dict[int, Optional[float]] = {}
 
         for _, fr, img_rel, steer_val in frames:
             sal_paths[fr] = saliency_path(args.out_shap, town, fr, args.pad,
                                           prefer="saliency.png", fallback=args.fallback_name)
-            if with_image_ssim:
-                img_paths[fr] = resolve_image_path(jsonl_dir, args.img_root, img_rel)
+            img_paths[fr] = resolve_image_path(jsonl_dir, args.img_root, img_rel)
             steer_map[fr] = steer_val
 
         # Compare consecutive frames
@@ -312,6 +312,8 @@ def main():
                     "curr_frame": f_curr,
                     "prev_path": str(sal_paths.get(f_prev) or ""),
                     "curr_path": str(sal_paths.get(f_curr) or ""),
+                    "prev_img_path": str(img_paths.get(f_prev, "")),
+                    "curr_img_path": str(img_paths.get(f_curr, "")),
                     "ssim": "",
                     "image_ssim": "",
                     "steer_sim": "",
@@ -374,6 +376,8 @@ def main():
                 "curr_frame": f_curr,
                 "prev_path": str(p_prev or ""),
                 "curr_path": str(p_curr or ""),
+                "prev_img_path": str(img_paths.get(f_prev, "")),
+                "curr_img_path": str(img_paths.get(f_curr, "")),
                 "ssim": "" if sal_val is None else f"{sal_val:.6f}",
                 "image_ssim": "" if img_val is None else f"{img_val:.6f}",
                 "steer_sim": "" if steer_val is None else f"{steer_val:.6f}",
@@ -395,7 +399,8 @@ def main():
     args.out_csv.parent.mkdir(parents=True, exist_ok=True)
     with args.out_csv.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
-            "town", "prev_frame", "curr_frame", "prev_path", "curr_path", "ssim", "image_ssim", "steer_sim", "note"
+            "town", "prev_frame", "curr_frame", "prev_path", "curr_path",
+            "prev_img_path", "curr_img_path", "ssim", "image_ssim", "steer_sim", "note"
         ])
         w.writeheader()
         w.writerows(rows)

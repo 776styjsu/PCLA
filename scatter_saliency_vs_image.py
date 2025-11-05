@@ -89,6 +89,8 @@ def load_rows(csv_path):
                 "curr_frame": r.get("curr_frame", ""),
                 "prev_path": r.get("prev_path", ""),
                 "curr_path": r.get("curr_path", ""),
+                "prev_img_path": r.get("prev_img_path", ""),
+                "curr_img_path": r.get("curr_img_path", ""),
                 "ssim": ssim,                # saliency similarity
                 "image_ssim": img_ssim,      # image similarity
                 "steer_sim": steer_sim,      # steering similarity
@@ -180,7 +182,7 @@ def dump_report(rows, mask_zoom, mask_topk, out_csv_path=None, include_non_topk=
             writer = csv.writer(f)
             writer.writerow([
                 "town", "prev_frame", "curr_frame",
-                "prev_path", "curr_path",
+                "prev_path", "curr_path", "prev_img_path", "curr_img_path",
                 "ssim", "image_ssim", "steer_sim", "is_topk"
             ])
             for i in idxs:
@@ -191,6 +193,8 @@ def dump_report(rows, mask_zoom, mask_topk, out_csv_path=None, include_non_topk=
                     r["curr_frame"],
                     r["prev_path"],
                     r["curr_path"],
+                    r["prev_img_path"],
+                    r["curr_img_path"],
                     f"{r['ssim']:.6f}",
                     f"{r['image_ssim']:.6f}",
                     f"{r['steer_sim']:.6f}",
