@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import math
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -13,11 +14,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize image and saliency pairs with metrics")
     parser.add_argument("csv", type=Path, help="CSV with saliency SSIM summary rows")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to save the figure")
-    parser.add_argument("--max-rows", type=int, default=100, help="Limit number of rows loaded from the CSV")
-    parser.add_argument("--title", type=str, default=None, help="Optional figure title")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Directory to save multi-part figures when data exceeds max rows")
+    parser.add_argument("--max-rows", type=int, default=100, help="Maximum rows rendered per figure")
+    parser.add_argument("--row-limit", type=int, default=None,
+                        help="Optional cap on total rows loaded from the CSV")
     parser.add_argument("--dpi", type=int, default=150, help="Figure DPI when saving")
     parser.add_argument("--no-show", action="store_true", help="Skip interactive display")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.output and args.output_dir:
+        parser.error("--output and --output-dir are mutually exclusive")
+    if args.max_rows <= 0:
+        parser.error("--max-rows must be positive")
+    if args.row_limit is not None and args.row_limit <= 0:
+        parser.error("--row-limit must be positive")
+
+    return args
 
 
 def load_rows(csv_path: Path, limit: Optional[int]) -> List[Dict[str, str]]:
@@ -40,11 +53,8 @@ def to_label(value: str, name: str) -> str:
         return f"{name}: {value}"
 
 
-def render(rows: List[Dict[str, str]], args: argparse.Namespace) -> None:
-    if not rows:
-        print("No rows to visualize.")
-        return
-
+def _create_figure(rows: List[Dict[str, str]], args: argparse.Namespace,
+                   part_idx: Optional[int] = None, total_parts: Optional[int] = None) -> plt.Figure:
     width_ratios = [1.1, 1.1, 0.9]
     fig_height = max(3.4 * len(rows), 3.5)
     fig = plt.figure(figsize=(sum(width_ratios) * 2.3, fig_height))
@@ -90,8 +100,35 @@ def render(rows: List[Dict[str, str]], args: argparse.Namespace) -> None:
         ax_text.text(0.02, 0.95, "\n".join(text_lines), ha="left", va="top", fontsize=8)
         ax_text.axis("off")
 
-    if args.title:
-        fig.suptitle(args.title, fontsize=12)
+    fig.tight_layout()
+
+    return fig
+
+
+def render(rows: List[Dict[str, str]], args: argparse.Namespace) -> None:
+    if not rows:
+        print("No rows to visualize.")
+        return
+
+    chunk_size = args.max_rows
+
+    if args.output_dir:
+        save_dir = args.output_dir
+        save_dir.mkdir(parents=True, exist_ok=True)
+        total_parts = math.ceil(len(rows) / chunk_size)
+        for part_idx in range(total_parts):
+            start = part_idx * chunk_size
+            end = start + chunk_size
+            chunk = rows[start:end]
+            fig = _create_figure(chunk, args, part_idx=part_idx, total_parts=total_parts)
+            output_name = f"{args.csv.stem}_part{part_idx + 1:03d}.png"
+            output_path = save_dir / output_name
+            fig.savefig(output_path, dpi=args.dpi, bbox_inches="tight")
+            print(f"Saved figure to {output_path}")
+            plt.close(fig)
+        return
+
+    fig = _create_figure(rows, args)
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -106,7 +143,10 @@ def render(rows: List[Dict[str, str]], args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    rows = load_rows(args.csv, args.max_rows)
+    limit = args.row_limit
+    if limit is None and args.output_dir is None:
+        limit = args.max_rows
+    rows = load_rows(args.csv, limit)
     render(rows, args)
 
 
