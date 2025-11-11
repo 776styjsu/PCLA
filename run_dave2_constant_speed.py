@@ -111,7 +111,7 @@ def main():
     parser.add_argument("--town", default="Town04", help="Town01..Town10 (or any installed map)")
     parser.add_argument("--ckpt", required=True, help="Path to DAVE2 checkpoint (state dict with ['model'])")
     parser.add_argument("--target-kmh", type=float, default=20.0)
-    parser.add_argument("--fps", type=float, default=30.0, help="Simulation fixed step (Hz)")
+    parser.add_argument("--fps", type=float, default=10.0, help="Simulation fixed step (Hz)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--seconds", type=int, default=300, help="How long to drive before quitting")
     parser.add_argument("--out", default=None, help="Dir to save logs (JSONL) and frames")
