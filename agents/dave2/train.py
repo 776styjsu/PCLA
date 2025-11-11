@@ -215,6 +215,15 @@ def _set_seeds(seed: int, device: str):
     np.random.seed(seed)
 
 
+def _save_checkpoint(model, opt, scaler, out_path: Path, meta: Dict):
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "scaler": (scaler.state_dict() if scaler is not None else None),
+        "meta": meta,
+    }, out_path)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -228,6 +237,8 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=str, default="checkpoints/dave2v1.pt")
     parser.add_argument("--height", type=int, default=180)
     parser.add_argument("--width", type=int, default=320)
+    parser.add_argument("--save-every", type=int, default=0,
+                        help="Save a checkpoint every K epochs (0 disables periodic saves)")
 
     # dataloader & reproducibility
     parser.add_argument("--workers", type=int, default=4)
@@ -254,6 +265,8 @@ if __name__ == "__main__":
         _p(f"img_root={args.img_root}")
     _p(f"workers(train/val)=({args.workers}/{args.val_workers})")
     _p(f"checkpoint_out={args.out}")
+    if args.save_every:
+        _p(f"periodic_saves=every {args.save_every} epoch(s)")
     _p("===================")
 
     train_ds = CarlaSteerDataset(train_paths,
@@ -283,7 +296,8 @@ if __name__ == "__main__":
     scaler = torch.cuda.amp.GradScaler() if (args.amp and device == "cuda") else None
 
     # Make sure output dir exists
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Train
     best = math.inf
@@ -306,33 +320,51 @@ if __name__ == "__main__":
         _p(f"epoch {ep:02d}  train {tr:.6f}  val {va:.6f}  "
            f"lr={lr_now if lr_now is not None else 'n/a'}  time={ep_time:.2f}s")
 
-        # Save best if we have a validation set
-        if val_ld and va < best:
-            best = va
-            torch.save({
-                "model": model.state_dict(),
-                "optimizer": opt.state_dict(),
-                "meta": {
+        # Periodic checkpoint every K epochs (if enabled)
+        if args.save_every and (ep % args.save_every == 0):
+            save_dir = out_path.parent
+            base = out_path.stem
+            suffix = out_path.suffix or ".pt"
+            per_ep_path = save_dir / f"{base}_ep{ep:03d}{suffix}"
+            _save_checkpoint(
+                model, opt, scaler, per_ep_path,
+                meta={
                     "input_shape": (args.height, args.width),
                     "epoch": ep,
                     "device": device,
+                    "train_loss": float(tr),
+                    "val_loss": float(va),
                 }
-            }, args.out)
-            _p(f"[checkpoint] new best val={va:.6f} saved to {args.out}")
+            )
+            _p(f"[checkpoint] periodic save @ epoch {ep} -> {per_ep_path}")
+
+        # Save best if we have a validation set
+        if val_ld and va < best:
+            best = va
+            _save_checkpoint(
+                model, opt, scaler, out_path,
+                meta={
+                    "input_shape": (args.height, args.width),
+                    "epoch": ep,
+                    "device": device,
+                    "train_loss": float(tr),
+                    "val_loss": float(va),
+                }
+            )
+            _p(f"[checkpoint] new best val={va:.6f} saved to {out_path}")
 
     total_time = time.time() - run_start
 
     # Fallback save if no val set
     if not val_ld:
-        torch.save({
-            "model": model.state_dict(),
-            "optimizer": opt.state_dict(),
-            "meta": {
+        _save_checkpoint(
+            model, opt, scaler, out_path,
+            meta={
                 "input_shape": (args.height, args.width),
                 "epoch": args.epochs,
                 "device": device,
             }
-        }, args.out)
-        _p(f"[checkpoint] (no val) final model saved to {args.out}")
+        )
+        _p(f"[checkpoint] (no val) final model saved to {out_path}")
 
     _p(f"Training complete in {total_time:.2f}s")
