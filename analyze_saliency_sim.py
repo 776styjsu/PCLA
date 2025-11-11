@@ -59,6 +59,11 @@ def parse_args():
     p.add_argument("--plot-dir", type=Path, default=None,
                    help="Directory to save plots (default: <out_csv>.parent / 'plots').")
     p.add_argument("--show-plots", action="store_true", help="Show plots interactively.")
+    p.add_argument(
+        "--auto-range",
+        action="store_true",
+        help="Autoscale plot axes to the data (default off; fixed [0,1] if not set).",
+    )
     p.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bar output.")
     return p.parse_args()
 
@@ -235,15 +240,27 @@ def make_plots(xs: List[int],
                base_name: str,
                sal_label: str,
                img_label: Optional[str],
-               show: bool = False) -> None:
-    """Generate time-series and scatter plots for the chosen metrics."""
+               show: bool = False,
+               fixed_range: bool = True) -> None:
+    """Generate time-series and scatter plots for the chosen metrics.
+
+    If fixed_range=True (default), all axes are clamped to [0,1].
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    METRIC_MIN, METRIC_MAX = 0.0, 1.0
 
     # Convert to arrays with NaNs for missing
     x = np.asarray(xs, dtype=np.int64)
     sal = np.array([np.nan if v is None else float(v) for v in sal_vals], dtype=np.float32)
     img = np.array([np.nan if v is None else float(v) for v in img_vals], dtype=np.float32)
     st  = np.array([np.nan if v is None else float(v) for v in steer_vals], dtype=np.float32)
+
+    if fixed_range:
+        # Keep displayed values within [0,1] so plots/fit lines use the full fixed domain/range
+        sal = np.clip(sal, METRIC_MIN, METRIC_MAX)
+        img = np.clip(img, METRIC_MIN, METRIC_MAX)
+        st  = np.clip(st,  METRIC_MIN, METRIC_MAX)
 
     # 1) Time series
     plt.figure(figsize=(10, 4.5), dpi=140)
@@ -253,8 +270,10 @@ def make_plots(xs: List[int],
     if not np.all(np.isnan(st)):
         plt.plot(x, st, label="Steer similarity")
     plt.xlabel("Pair index (consecutive frames within-towns only)")
-    plt.ylabel("Metric value")
+    plt.ylabel("Metric value (0-1)" if fixed_range else "Metric value")
     plt.title("Metric trends over time")
+    if fixed_range:
+        plt.ylim(METRIC_MIN, METRIC_MAX)
     plt.legend()
     ts_path = out_dir / f"{base_name}_timeseries.png"
     plt.tight_layout()
@@ -268,11 +287,15 @@ def make_plots(xs: List[int],
         mask_img = ~np.isnan(sal) & ~np.isnan(img)
     else:
         mask_img = np.zeros_like(sal, dtype=bool)
+
     if img_label is not None and np.count_nonzero(mask_img) >= 2:
         s = sal[mask_img]; g = img[mask_img]
         r = float(np.corrcoef(s, g)[0, 1])
+        if fixed_range:
+            xfit = np.linspace(METRIC_MIN, METRIC_MAX, 100, dtype=np.float32)
+        else:
+            xfit = np.linspace(np.nanmin(s), np.nanmax(s), 100, dtype=np.float32)
         m, b = np.polyfit(s, g, 1)
-        xfit = np.linspace(np.nanmin(s), np.nanmax(s), 100, dtype=np.float32)
         yfit = m * xfit + b
 
         plt.figure(figsize=(6.5, 6.0), dpi=140)
@@ -281,6 +304,9 @@ def make_plots(xs: List[int],
         plt.xlabel(f"Saliency {sal_label}")
         plt.ylabel(f"Image {img_label}")
         plt.title(f"Relationship (Pearson r = {r:.3f})")
+        if fixed_range:
+            plt.xlim(METRIC_MIN, METRIC_MAX)
+            plt.ylim(METRIC_MIN, METRIC_MAX)
         plt.legend()
         sc_path = out_dir / f"{base_name}_scatter.png"
         plt.tight_layout()
@@ -294,8 +320,11 @@ def make_plots(xs: List[int],
     if np.count_nonzero(mask_st) >= 2:
         s = sal[mask_st]; g = st[mask_st]
         r = float(np.corrcoef(s, g)[0, 1])
+        if fixed_range:
+            xfit = np.linspace(METRIC_MIN, METRIC_MAX, 100, dtype=np.float32)
+        else:
+            xfit = np.linspace(np.nanmin(s), np.nanmax(s), 100, dtype=np.float32)
         m, b = np.polyfit(s, g, 1)
-        xfit = np.linspace(np.nanmin(s), np.nanmax(s), 100, dtype=np.float32)
         yfit = m * xfit + b
 
         plt.figure(figsize=(6.5, 6.0), dpi=140)
@@ -304,6 +333,9 @@ def make_plots(xs: List[int],
         plt.xlabel(f"Saliency {sal_label}")
         plt.ylabel("Steer similarity")
         plt.title(f"Relationship (Pearson r = {r:.3f})")
+        if fixed_range:
+            plt.xlim(METRIC_MIN, METRIC_MAX)
+            plt.ylim(METRIC_MIN, METRIC_MAX)
         plt.legend()
         sc_path = out_dir / f"{base_name}_scatter_steer.png"
         plt.tight_layout()
@@ -311,6 +343,7 @@ def make_plots(xs: List[int],
         if show:
             plt.show()
         plt.close()
+
 
 
 def main():
@@ -560,7 +593,8 @@ def main():
                    base_name=base_plot_name,
                    sal_label=sal_metric.display_name,
                    img_label=image_metric.display_name if image_metric else None,
-                   show=args.show_plots)
+                   show=args.show_plots,
+                   fixed_range=not args.auto_range)
 
     # Summary
     print(f"Wrote: {args.out_csv}")
