@@ -123,7 +123,7 @@ def main():
     parser.add_argument("--ffmpeg-codec", default="libx264",
                         help="ffmpeg codec: libx264 (best), mpeg4 (fallback), libx265, hevc_nvenc, etc.")
     parser.add_argument("--ffmpeg-crf", type=int, default=23,
-                        help="ffmpeg CRF (lower=better quality, 17–28 typical) for libx264/265")
+                        help="ffmpeg CRF (lower=better quality, 17-28 typical) for libx264/265")
     parser.add_argument("--ffmpeg-preset", default="veryfast",
                         help="x264/x265 preset (ultrafast..placebo). Speed/quality tradeoff.")
     args = parser.parse_args()
