@@ -6,7 +6,7 @@ import numpy as np
 import os
 import time
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import hashlib
 import random
 
@@ -48,7 +48,9 @@ class CarlaSteerDataset(Dataset):
                  augment: bool = False,
                  hflip_prob: float = 0.5,
                  jitter: float = 0.2,
-                 noise_std: float = 0.01):
+                 noise_std: float = 0.01,
+                 hshift_px: int = 0,
+                 hshift_frac: float = 0.0):
         self.samples: List[Dict] = []
         self.img_root = img_root
 
@@ -56,6 +58,8 @@ class CarlaSteerDataset(Dataset):
         self.augment = augment
         self.hflip_prob = hflip_prob
         self.noise_std = noise_std
+        self.hshift_px = max(0, int(hshift_px))
+        self.hshift_frac = max(0.0, float(hshift_frac))
 
         # Build transforms in pieces so we can mix PIL- and tensor-based steps
         self.resize = Resize(resize)
@@ -101,6 +105,23 @@ class CarlaSteerDataset(Dataset):
             p = self.img_root / p
         return p
 
+    def _apply_horizontal_shift(self, img: Image.Image) -> Image.Image:
+        max_shift = self.hshift_px
+        if self.hshift_frac > 0.0:
+            frac_pixels = int(round(self.hshift_frac * img.width))
+            if frac_pixels > max_shift:
+                max_shift = frac_pixels
+        if max_shift <= 0:
+            return img
+        shift = random.randint(-max_shift, max_shift)
+        if shift == 0:
+            return img
+        pad = max_shift
+        expanded = ImageOps.expand(img, border=(pad, 0, pad, 0), fill=0)
+        left = pad + shift
+        box = (left, 0, left + img.width, img.height)
+        return expanded.crop(box)
+
     def __len__(self):
         return len(self.samples)
 
@@ -117,13 +138,12 @@ class CarlaSteerDataset(Dataset):
                 img = im.convert("RGB")
 
             # steering: control.steer (fallback to top-level "steer")
-            if "control" in r and "steer" in r["control"]:
-                steer = float(r["control"]["steer"])
-            else:
-                steer = float(r["steer"])
+            steer = _extract_steer(r)
 
             # ---- TRAIN-TIME AUGMENTATION (if enabled) ----
             if self.augment:
+                if self.hshift_px > 0 or self.hshift_frac > 0.0:
+                    img = self._apply_horizontal_shift(img)
                 # 1) Horizontal flip + sign flip on steering
                 if self.hflip_prob > 0.0 and random.random() < self.hflip_prob:
                     img = ImageOps.mirror(img)
@@ -183,6 +203,18 @@ def _infer_group(rec: Dict, group_key: str, from_path: bool) -> str:
             return m.group(1)
     return "unknown"
 
+
+def _extract_steer(rec: Dict) -> float:
+    """Return steering value from a log record, defaulting to 0.0 if missing."""
+    try:
+        if "control" in rec and isinstance(rec["control"], dict) and "steer" in rec["control"]:
+            return float(rec["control"]["steer"])
+        if "steer" in rec:
+            return float(rec["steer"])
+    except (ValueError, TypeError):
+        pass
+    return 0.0
+
 def _stable_group_seed(group: str, global_seed: int) -> int:
     """
     Turn (group name, global seed) into a stable 32-bit integer seed.
@@ -198,7 +230,11 @@ def _build_equal_subset_indices(samples: List[Dict],
                                 subset_total: int,
                                 subset_per_group: int,
                                 subset_percent: float,
-                                seed: int):
+                                seed: int,
+                                min_steer_mag: float = 0.0,
+                                min_steer_frac: float = 0.0,
+                                steer_oversample: bool = False,
+                                steer_oversample_max: int = 0) -> Tuple[List[int], Dict[str, int], Dict[str, Dict[str, float]]]:
     """
     Deterministically select equal counts per group (town).
     Precedence: per_group > total > percent.
@@ -213,7 +249,7 @@ def _build_equal_subset_indices(samples: List[Dict],
     # decide target per group
     G = len(groups)
     if G == 0:
-        return None, {}
+        return None, {}, {}
     if subset_per_group and subset_per_group > 0:
         target = subset_per_group
     elif subset_total and subset_total > 0:
@@ -222,11 +258,21 @@ def _build_equal_subset_indices(samples: List[Dict],
         min_size = min(len(v) for v in groups.values())
         target = max(1, int(min_size * float(subset_percent)))
     else:
-        return None, {g: len(v) for g, v in groups.items()}  # no subsetting
+        stats = {g: {"total": len(v), "hi": 0, "required_hi": 0, "available_hi": 0}
+                 for g, v in groups.items()}
+        return None, {g: len(v) for g, v in groups.items()}, stats  # no subsetting
+
+    enforce_hi = (min_steer_mag > 0.0) and (min_steer_frac > 0.0)
+    if steer_oversample_max < 0:
+        steer_oversample_max = 0
+
+    # cache steering magnitudes once to avoid re-parsing
+    steer_cache = [abs(_extract_steer(rec)) for rec in samples]
 
     # deterministic per-group shuffle, take first k
     chosen = []
     out_counts = {}
+    out_stats = {}
     for g, idxs in groups.items():
         # Stable seed derived from group name + global seed.
         # This makes the permutation for each (group, seed) pair fixed,
@@ -239,15 +285,80 @@ def _build_equal_subset_indices(samples: List[Dict],
 
         k = min(target, len(idxs))
         out_counts[g] = int(k)
-        if k > 0:
-            chosen.append(idxs[:k])
+        if k <= 0:
+            out_stats[g] = {"total": 0, "hi": 0, "required_hi": 0, "available_hi": len(idxs)}
+            continue
+
+        selected: List[int] = []
+        hi_target = 0
+        hi_available = 0
+        if enforce_hi:
+            hi_mask = np.array([steer_cache[int(i)] >= min_steer_mag for i in idxs], dtype=bool)
+            hi_pool = idxs[hi_mask]
+            lo_pool = idxs[~hi_mask]
+            hi_available = len(hi_pool)
+            hi_target = min(k, int(math.ceil(k * min_steer_frac)))
+
+            take = min(hi_target, hi_available)
+            hi_selected = hi_pool[:take].tolist()
+
+            # optional oversampling up to hi_target using replacement
+            if steer_oversample and hi_available > 0 and take < hi_target:
+                needed = hi_target - take
+                usage = {int(i): 1 for i in hi_selected}
+                while needed > 0:
+                    draws = rng.choice(hi_pool, size=needed, replace=True)
+                    added = 0
+                    for idx in draws:
+                        idx = int(idx)
+                        if steer_oversample_max > 0 and usage.get(idx, 0) >= steer_oversample_max:
+                            continue
+                        hi_selected.append(idx)
+                        usage[idx] = usage.get(idx, 0) + 1
+                        added += 1
+                        if len(hi_selected) >= hi_target:
+                            break
+                    if added == 0:
+                        break  # cannot add more due to cap
+                    needed = hi_target - len(hi_selected)
+
+            selected.extend(hi_selected[:hi_target])
+            fill_pool = list(hi_pool[hi_target:]) + lo_pool.tolist()
+        else:
+            fill_pool = idxs.tolist()
+
+        for idx in fill_pool:
+            if len(selected) >= k:
+                break
+            selected.append(int(idx))
+
+        # Fallback: if we still do not have enough due to caps, recycle the shuffled indices
+        if len(selected) < k:
+            base = idxs.tolist()
+            if base:
+                needed = k - len(selected)
+                reps = (needed + len(base) - 1) // len(base)
+                recycled = (base * reps)[:needed]
+                selected.extend(int(x) for x in recycled)
+
+        selected = selected[:k]
+
+        chosen.append(np.array(selected, dtype=np.int64))
+
+        hi_used = sum(1 for idx in selected if steer_cache[int(idx)] >= min_steer_mag) if enforce_hi else 0
+        out_stats[g] = {
+            "total": len(selected),
+            "hi": hi_used,
+            "required_hi": hi_target,
+            "available_hi": hi_available,
+        }
 
     if not chosen:
-        return None, {g: 0 for g in groups.keys()}
+        return None, {g: 0 for g in groups.keys()}, out_stats
     chosen = np.concatenate(chosen)
     # keep global order deterministic but irrelevant (DataLoader shuffles anyway)
     chosen.sort(kind="mergesort")
-    return chosen.tolist(), out_counts
+    return chosen.tolist(), out_counts, out_stats
 
 def expand_jsonl_args(paths: List[str]) -> List[Path]:
     out: List[Path] = []
@@ -440,6 +551,10 @@ if __name__ == "__main__":
                         help="Color jitter strength (0 disables if 0).")
     parser.add_argument("--aug-noise-std", type=float, default=0.01,
                         help="Std dev of Gaussian noise added after ToTensor for train images.")
+    parser.add_argument("--aug-hshift-px", type=int, default=0,
+                        help="Max horizontal pixel shift before resize (0 disables).")
+    parser.add_argument("--aug-hshift-frac", type=float, default=0.0,
+                        help="Additional horizontal shift as fraction of width (0 disables).")
 
     # --- subset options (balanced by town) ---
     parser.add_argument("--subset-per-group", type=int, default=0,
@@ -452,6 +567,14 @@ if __name__ == "__main__":
                         help="JSON field name for grouping (default: 'town').")
     parser.add_argument("--group-from-path", action="store_true",
                         help="Infer group from image_path using regex '(Town\\d+HD|Town\\d+)'.")
+    parser.add_argument("--min-steer-mag", type=float, default=0.0,
+                        help="If >0, require at least --min-steer-frac of each group's subset to have |steer|>=this.")
+    parser.add_argument("--min-steer-frac", type=float, default=0.0,
+                        help="Minimum fraction of each group's subset that must satisfy |steer|>=--min-steer-mag.")
+    parser.add_argument("--steer-oversample", action="store_true",
+                        help="Allow sampling with replacement to satisfy the min-steer constraint when data is scarce.")
+    parser.add_argument("--steer-oversample-max", type=int, default=0,
+                        help="Max times a single frame can appear when oversampling hi-steer data (0 => unlimited).")
 
     parser.add_argument("--resume", type=str, default="",
         help="Path to a checkpoint .pt to resume from.")
@@ -484,7 +607,11 @@ if __name__ == "__main__":
     if args.save_every:
         _p(f"periodic_saves=every {args.save_every} epoch(s)")
     _p(f"augment={args.augment}  hflip_prob={args.aug_hflip_prob}  "
-       f"jitter={args.aug_jitter}  noise_std={args.aug_noise_std}")
+       f"jitter={args.aug_jitter}  noise_std={args.aug_noise_std}  "
+       f"hshift_px={args.aug_hshift_px}  hshift_frac={args.aug_hshift_frac}")
+    if args.min_steer_mag > 0.0 and args.min_steer_frac > 0.0:
+        _p(f"steer_balance: |steer|>={args.min_steer_mag} in >= {args.min_steer_frac*100:.1f}% of each group" +
+           (" (oversample enabled)" if args.steer_oversample else ""))
     _p("===================")
 
     train_ds = CarlaSteerDataset(
@@ -496,6 +623,8 @@ if __name__ == "__main__":
         hflip_prob=args.aug_hflip_prob,
         jitter=args.aug_jitter,
         noise_std=args.aug_noise_std,
+        hshift_px=args.aug_hshift_px,
+        hshift_frac=args.aug_hshift_frac,
     )
 
     val_ds = (
@@ -513,14 +642,18 @@ if __name__ == "__main__":
     _p(f"train_samples={len(train_ds)}  val_samples={0 if val_ds is None else len(val_ds)}")
 
     # === Balanced subsetting by group (e.g., by town) ===
-    subset_indices, subset_counts = _build_equal_subset_indices(
+    subset_indices, subset_counts, subset_stats = _build_equal_subset_indices(
         samples=getattr(train_ds, "samples", []),
         group_key=args.group_key,
         from_path=args.group_from_path,
         subset_total=args.subset_total,
         subset_per_group=args.subset_per_group,
         subset_percent=args.subset_percent,
-        seed=args.seed
+        seed=args.seed,
+        min_steer_mag=args.min_steer_mag,
+        min_steer_frac=args.min_steer_frac,
+        steer_oversample=args.steer_oversample,
+        steer_oversample_max=args.steer_oversample_max,
     )
 
     if subset_indices is not None:
@@ -530,6 +663,19 @@ if __name__ == "__main__":
         kept = sum(subset_counts.values())
         _p(f"[subset] enabled: kept={kept} samples "
            f"(equal per group). Breakdown: {subset_counts}")
+        if args.min_steer_mag > 0.0 and args.min_steer_frac > 0.0:
+            hi_msgs = []
+            for town, stats in subset_stats.items():
+                if stats["total"] == 0:
+                    continue
+                hi_msgs.append(
+                    f"{town}: hi={stats['hi']}/{stats['total']} "
+                    f"(req {stats['required_hi']}, avail {stats['available_hi']})"
+                )
+            if hi_msgs:
+                _p(f"[subset] steer balance (>|{args.min_steer_mag}|): " + ", ".join(hi_msgs))
+            if args.steer_oversample and args.steer_oversample_max:
+                _p(f"[subset] oversample cap per sample: {args.steer_oversample_max}")
     else:
         _p("[subset] disabled (using full training set)")
 

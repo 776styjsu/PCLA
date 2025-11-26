@@ -130,7 +130,7 @@ def main():
 
     random.seed(args.seed)
     client = carla.Client(args.host, args.port)
-    client.set_timeout(10.0)
+    client.set_timeout(60.0)
 
     world = client.get_world()
     if args.town and (world.get_map().name.split("/")[-1] != args.town):
@@ -368,6 +368,8 @@ def main():
 
             if sim_time >= args.seconds:
                 print("[INFO] Time limit reached, stopping.")
+                if args.out:
+                    (Path(args.out) / "done").touch()
                 break
 
             if steps % int(sim_fps) == 0:
