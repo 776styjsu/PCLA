@@ -65,7 +65,37 @@ def parse_args():
         help="Autoscale plot axes to the data (default off; fixed [0,1] if not set).",
     )
     p.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bar output.")
+    p.add_argument(
+        "--highlight-csv",
+        type=Path,
+        default=None,
+        help="Optional CSV containing high image/steer similarity but low saliency similarity frames "
+             "to highlight (in light red).",
+    )
     return p.parse_args()
+
+
+def load_highlight_frames(path: Path) -> Set[int]:
+    frames = set()
+    if not path.exists():
+        print(f"Warning: Highlight CSV {path} not found.")
+        return frames
+        
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            # Try curr_frame first, then prev_frame
+            val = row.get("curr_frame")
+            if not val:
+                val = row.get("prev_frame")
+            
+            if val:
+                try:
+                    frames.add(int(val))
+                except ValueError:
+                    pass
+    print(f"Loaded {len(frames)} frames to highlight from {path}")
+    return frames
 
 
 def load_jsonl_records(jsonl_path: Path) -> Tuple[List[Dict], List[Dict]]:
@@ -103,18 +133,28 @@ def extract_frame_from_image_path(image_path: str) -> Optional[int]:
 
 
 def saliency_path(out_shap_root: Path, town: str, frame: int, pad: int,
-                  prefer: str = "saliency.png", fallback: Optional[str] = None) -> Optional[Path]:
-    """Build path <out_shap>/<TownXX>/<TownXX_XXXXXX>/<prefer> (fallback optional)."""
+                  prefer: str = "saliency.png", fallback: Optional[str] = None) -> Path:
+    """Build path. Tries <out_shap>/<TownXX>/<TownXX_XXXXXX>/... and <out_shap>/<TownXX_XXXXXX>/..."""
     frame_dir = f"{town}__{frame:0{pad}d}"
-    base = out_shap_root / town / frame_dir
-    prefer_path = base / prefer
-    if prefer_path.exists():
-        return prefer_path
-    if fallback:
-        fb = base / fallback
-        if fb.exists():
-            return fb
-    return prefer_path if prefer_path.exists() else None
+    
+    # Candidate 1: Standard structure <root>/<town>/<frame_dir>
+    base1 = out_shap_root / town / frame_dir
+    p1 = base1 / prefer
+    if p1.exists():
+        return p1
+    if fallback and (base1 / fallback).exists():
+        return base1 / fallback
+        
+    # Candidate 2: Flat structure <root>/<frame_dir>
+    base2 = out_shap_root / frame_dir
+    p2 = base2 / prefer
+    if p2.exists():
+        return p2
+    if fallback and (base2 / fallback).exists():
+        return base2 / fallback
+
+    # If neither exists, return the standard one (p1) so the user sees what was expected
+    return p1
 
 
 def resolve_image_path(jsonl_dir: Path, img_root: Optional[Path], image_path: str) -> Path:
@@ -241,7 +281,8 @@ def make_plots(xs: List[int],
                sal_label: str,
                img_label: Optional[str],
                show: bool = False,
-               fixed_range: bool = True) -> None:
+               fixed_range: bool = True,
+               highlight_indices: Optional[List[int]] = None) -> None:
     """Generate time-series and scatter plots for the chosen metrics.
 
     If fixed_range=True (default), all axes are clamped to [0,1].
@@ -264,6 +305,25 @@ def make_plots(xs: List[int],
 
     # 1) Time series
     plt.figure(figsize=(10, 4.5), dpi=140)
+    
+    # Add highlights
+    if highlight_indices:
+        # Filter indices that are within the current plot range (though we plot all)
+        # Use vlines
+        # We need to be careful if x is not contiguous or monotonic, but here x is pair index.
+        # x is just xs which is pair_indices.
+        # highlight_indices contains values from xs.
+        
+        # We can just plot vertical lines at the x-values corresponding to highlight_indices
+        # Since xs contains the x-coordinates, and highlight_indices are values from xs.
+        
+        # Let's verify: xs is pair_indices. highlight_indices is a subset of pair_indices.
+        # So we can just plot lines at x for x in highlight_indices.
+        
+        # To avoid plotting thousands of lines individually, we can use vlines with a list.
+        plt.vlines(highlight_indices, METRIC_MIN if fixed_range else 0, METRIC_MAX if fixed_range else 1,
+                   colors='red', alpha=0.2, linewidth=1, zorder=0, label='High I/O sim, low saliency sim')
+
     plt.plot(x, sal, label=f"Saliency {sal_label}")  # NaNs break the line automatically
     if img_label and not np.all(np.isnan(img)):
         plt.plot(x, img, label=f"Image {img_label}")
@@ -411,6 +471,11 @@ def main():
         for k in range(1, args.skip_after_respawn + 1):
             s.add(f + k)
 
+    # Load highlight frames if provided
+    highlight_frames: Set[int] = set()
+    if args.highlight_csv:
+        highlight_frames = load_highlight_frames(args.highlight_csv)
+
     rows: List[Dict] = []
     total_pairs = 0
     computed = 0
@@ -420,6 +485,7 @@ def main():
 
     # For plotting
     pair_indices: List[int] = []
+    highlight_indices: List[int] = []
     sal_series: List[Optional[float]] = []
     img_series: List[Optional[float]] = []
     steer_series: List[Optional[float]] = []
@@ -448,7 +514,7 @@ def main():
             continue
 
         # Preload paths/metadata for this town
-        sal_paths: Dict[int, Optional[Path]] = {}
+        sal_paths: Dict[int, Path] = {}
         img_paths: Dict[int, Path] = {}
         steer_map: Dict[int, Optional[float]] = {}
 
@@ -564,6 +630,8 @@ def main():
 
             # Collect for plotting
             pair_indices.append(global_pair_idx)
+            if highlight_frames and (f_curr in highlight_frames or f_prev in highlight_frames):
+                highlight_indices.append(global_pair_idx)
             sal_series.append(sal_val)
             img_series.append(img_val)
             steer_series.append(steer_val)
@@ -594,7 +662,8 @@ def main():
                    sal_label=sal_metric.display_name,
                    img_label=image_metric.display_name if image_metric else None,
                    show=args.show_plots,
-                   fixed_range=not args.auto_range)
+                   fixed_range=not args.auto_range,
+                   highlight_indices=highlight_indices)
 
     # Summary
     print(f"Wrote: {args.out_csv}")

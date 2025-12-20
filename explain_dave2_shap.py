@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import re
+import random
 from pathlib import Path
 from typing import Tuple, Optional, Union, Dict, Any, List
 
@@ -328,7 +329,8 @@ def explain_one_image(model: nn.Module,
                       preprocess,
                       bg_mode: str,
                       shared_explainer: Optional[shap.GradientExplainer],
-                      bg_count: int) -> bool:
+                      bg_count: int,
+                      seed: int = 42) -> bool:
     """
     Compute prediction + SHAP for a single image file and write artifacts to out_dir.
     Returns True on success, False on (recoverable) failure.
@@ -354,6 +356,12 @@ def explain_one_image(model: nn.Module,
         explainer = shared_explainer
         if explainer is None:
             raise RuntimeError(f"shared_explainer is None for {bg_mode} mode")
+        
+        # Reset seeds for determinism across images
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        random.seed(seed)
+        
         shap_vals_list = explainer.shap_values(x)
     elif bg_mode == "per_frame_blur":
         bg = build_blur_background(img_pil, preprocess, dev, n=bg_count)
@@ -369,6 +377,10 @@ def explain_one_image(model: nn.Module,
 
     # Saliency = sum |SHAP| across channels
     shap_sum_abs = np.abs(shap_chw).sum(axis=0)  # (H,W)
+    
+    # Debug checksum
+    # print(f"[DEBUG] {img_path.name} SHAP checksum: {np.sum(shap_chw):.6f}", flush=True)
+
     np.save(out_dir / "shap_values.npy", shap_chw)
     np.save(out_dir / "shap_sum_abs.npy", shap_sum_abs)
 
@@ -440,7 +452,7 @@ def parse_args():
     ap.add_argument("--input-h", type=int, default=180)
     ap.add_argument("--input-w", type=int, default=320)
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
-    ap.add_argument("--bg", type=int, default=8, help="# background samples for SHAP (K for kmeans/blur modes)")
+    ap.add_argument("--bg", type=int, default=16, help="# background samples for SHAP (K for kmeans/blur modes)")
     ap.add_argument("--bg-seed", type=int, default=42, help="Seed for building blurred/kmeans backgrounds")
     ap.add_argument("--bg-mode", default="fixed_dataset_kmeans",
                     choices=["fixed_zero", "per_frame_blur", "fixed_dataset_blur", "fixed_dataset_kmeans"],
@@ -462,7 +474,26 @@ def parse_args():
 
 
 def main():
+    # Force deterministic algorithms for CuBLAS (needed for torch.use_deterministic_algorithms)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
     args = parse_args()
+
+    # Ensure determinism
+    seed = args.bg_seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # Enable deterministic algorithms
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except AttributeError:
+            pass  # Older torch versions might not have this or warn_only
+
     # --- MODIFIED: Cast model to DAVE2v1 type hint ---
     model: DAVE2v1
     model, dev = load_dave2(args.ckpt, input_shape=(args.input_h, args.input_w), device=args.device)
@@ -488,7 +519,8 @@ def main():
         img_path = Path(args.image)
         out_dir = Path(args.out)
         ok = explain_one_image(model, dev, img_path, out_dir, preprocess,
-                               args.bg_mode, shared_explainer, args.bg)
+                               args.bg_mode, shared_explainer, args.bg,
+                               seed=args.bg_seed)
         if ok:
             print(f"[OK] Wrote artifacts to: {out_dir.resolve()}", flush=True)
         else:
@@ -530,6 +562,7 @@ def main():
             max_samples_for_kmeans=args.kmeans_sample_size
         )
         print(f"[INFO] Built fixed_dataset_kmeans background set with {bg_fixed.shape[0]} samples.", flush=True)
+        print(f"[INFO] Background checksum: {bg_fixed.sum().item():.4f}", flush=True)
         shared_explainer = shap.GradientExplainer(model, bg_fixed)
 
 
@@ -579,7 +612,8 @@ def main():
             continue
 
         ok = explain_one_image(model, dev, Path(img_abs), out_dir, preprocess,
-                               args.bg_mode, shared_explainer, args.bg)
+                               args.bg_mode, shared_explainer, args.bg,
+                               seed=args.bg_seed)
         if ok:
             processed += 1
         else:

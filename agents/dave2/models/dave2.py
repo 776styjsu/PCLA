@@ -17,7 +17,10 @@ class DAVE2v1(nn.Module):
         super().__init__()
         self.input_shape = input_shape  # (H, W)
 
-        self.bn1 = nn.BatchNorm2d(3, eps=1e-3, momentum=0.99, track_running_stats=False)
+        # Default implementation of DAVE-2 uses batch norm without running stats.
+        # track_running_stats=False breaks GradientSHAP by making normalization batch-dependent, causing noisy gradients.
+        # self.bn1 = nn.BatchNorm2d(3, eps=1e-3, momentum=0.99, track_running_stats=False)
+        self.bn1 = nn.BatchNorm2d(3, eps=1e-3, momentum=0.99, track_running_stats=True)
         self.conv1 = nn.Conv2d(3, 24, 5, stride=2)
         self.conv2 = nn.Conv2d(24, 36, 5, stride=2)
         self.conv3 = nn.Conv2d(36, 48, 5, stride=2)

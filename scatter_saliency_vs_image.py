@@ -33,6 +33,7 @@ Default axes are fixed to [0,1]. Supplying any --img-*/--sal-* bounds zooms that
 
 import argparse
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +49,36 @@ def safe_float(x):
         return float(x)
     except Exception:
         return None
+
+
+def load_measurements(jsonl_path):
+    """
+    Load speed from measurements.jsonl.
+    Returns dict: town -> frame -> speed_kmh
+    """
+    data = {}
+    with open(jsonl_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            
+            town = rec.get("town")
+            frame = rec.get("frame")
+            speed = rec.get("speed_kmh")
+            
+            if town and frame is not None and speed is not None:
+                if town not in data:
+                    data[town] = {}
+                try:
+                    data[town][int(frame)] = float(speed)
+                except ValueError:
+                    pass
+    return data
 
 
 def load_rows(csv_path):
@@ -256,9 +287,14 @@ def main():
     ap.add_argument("--out", default="out.png", help="Where to save the plot.")
     ap.add_argument("--title", default="Saliency vs Image Similarity",
                     help="Plot title.")
+    ap.add_argument("--no-pearson", action="store_true",
+                    help="Do not show Pearson correlation coefficient in title.")
     ap.add_argument("--topk", type=float, default=0.10,
                     help="Top K fraction for steer_sim highlight "
                          "(default 0.10 = top 10%).")
+
+    ap.add_argument("--measurements", help="Path to measurements.jsonl (required if --min-speed is used).")
+    ap.add_argument("--min-speed", type=float, default=None, help="Ignore data points where vehicle speed (km/h) is below this threshold.")
 
     # Zoom / filter thresholds
     ap.add_argument("--img-min", type=float, default=None,
@@ -286,6 +322,8 @@ def main():
                          "(TL uses x<=Qx(frac) & y>=Qy(1-frac); BR uses x>=Qx(1-frac) & y<=Qy(frac)).")
     ap.add_argument("--dump-corner-csv", default=None,
                     help="If set, write TL/BR top-K corner rows to this CSV (adds 'corner' column).")
+    ap.add_argument("--report-all-topk", action="store_true",
+                    help="If set, dump-csv/reporting includes all top-k steer_sim rows, not just the corners.")
 
     args = ap.parse_args()
 
@@ -293,6 +331,42 @@ def main():
     rows = load_rows(args.csv)
     if not rows:
         raise RuntimeError("No valid rows after parsing. Check your CSV columns?")
+
+    # Filter by speed if requested
+    if args.min_speed is not None:
+        if not args.measurements:
+            raise RuntimeError("--measurements is required when using --min-speed")
+        
+        print(f"Loading measurements from {args.measurements}...")
+        measurements = load_measurements(args.measurements)
+        
+        filtered_rows = []
+        skipped_speed = 0
+        for r in rows:
+            town = r["town"]
+            # Use curr_frame for speed check
+            try:
+                curr_frame = int(r["curr_frame"])
+            except ValueError:
+                continue
+                
+            speed = measurements.get(town, {}).get(curr_frame)
+            
+            if speed is None:
+                # If speed is missing, drop it as we can't verify the condition
+                skipped_speed += 1
+                continue
+                
+            if speed >= args.min_speed:
+                filtered_rows.append(r)
+            else:
+                skipped_speed += 1
+        
+        print(f"Filtered {skipped_speed} rows due to speed < {args.min_speed} km/h (or missing speed). Remaining: {len(filtered_rows)}")
+        rows = filtered_rows
+        
+        if not rows:
+             raise RuntimeError("No rows left after speed filtering.")
 
     # Grab vectors
     image_ssim = np.array([d["image_ssim"] for d in rows], dtype=float)
@@ -306,7 +380,12 @@ def main():
     low_mask = ~high_mask
 
     # Corners within TOP-K
+    # We only care about Bottom-Right (BR) now: High Image Sim, Low Saliency Sim
+    # TL (Top-Left) is ignored.
     tl_mask, br_mask, thr = compute_corner_masks(image_ssim, saliency_ssim, high_mask, args.corner_frac)
+    
+    # Force TL mask to be empty so it's not plotted or reported
+    tl_mask[:] = False
 
     # --- Plot ---
     plt.figure(figsize=(7, 5), dpi=150)
@@ -334,25 +413,23 @@ def main():
         color="#ff7f0e",
     )
 
-    # Overlays: TL (triangle), BR (square)
-    if tl_mask.any():
-        plt.scatter(
-            image_ssim[tl_mask], saliency_ssim[tl_mask],
-            s=70, alpha=1.0, marker="^",
-            edgecolors="black", linewidths=0.6, color="#d62728",
-            label=f"top-K TL (x≤{thr['x_lo']:.2f}, y≥{thr['y_hi']:.2f})"
-        )
+    # Overlays: BR (triangle, red)
     if br_mask.any():
         plt.scatter(
             image_ssim[br_mask], saliency_ssim[br_mask],
-            s=70, alpha=1.0, marker="s",
-            edgecolors="black", linewidths=0.6, color="#2ca02c",
+            s=70, alpha=1.0, marker="^",
+            edgecolors="black", linewidths=0.6, color="#d62728",
             label=f"top-K BR (x≥{thr['x_hi']:.2f}, y≤{thr['y_lo']:.2f})"
         )
 
     plt.xlabel("Image similarity (image_ssim)")
     plt.ylabel("Saliency similarity (ssim)")
-    plt.title(args.title)
+
+    final_title = args.title
+    if not args.no_pearson and len(image_ssim) > 1:
+        r_val = np.corrcoef(image_ssim, saliency_ssim)[0, 1]
+        final_title += f" (r={r_val:.3f})"
+    plt.title(final_title)
 
     plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.4)
     plt.legend(loc="best", frameon=True)
@@ -367,11 +444,10 @@ def main():
     print(f"[plot] Saved plot to {out_path} (top-k cutoff steer_sim >= {cutoff:.4f})")
 
     # Corner summary
-    n_tl, n_br = int(tl_mask.sum()), int(br_mask.sum())
+    n_br = int(br_mask.sum())
     print(f"[corners] frac={args.corner_frac:.2f}  "
           f"x_lo={thr['x_lo']:.3f}, x_hi={thr['x_hi']:.3f}, "
           f"y_lo={thr['y_lo']:.3f}, y_hi={thr['y_hi']:.3f}")
-    print(f"[corners] top-left (TL) count: {n_tl}")
     print(f"[corners] bottom-right (BR) count: {n_br}")
 
     if args.dump_corner_csv:
@@ -379,10 +455,17 @@ def main():
 
     # --- Reporting of interesting cases (zoom region) ---
     zoom_mask = build_zoom_mask(image_ssim, saliency_ssim, steer_sim, args)
+
+    # Determine which subset of top-k to report (default: only corners)
+    if args.report_all_topk:
+        report_subset_mask = high_mask
+    else:
+        report_subset_mask = tl_mask | br_mask
+
     dump_report(
         rows,
         mask_zoom=zoom_mask,
-        mask_topk=high_mask,
+        mask_topk=report_subset_mask,
         out_csv_path=args.dump_csv,
         include_non_topk=args.include_non_topk,
     )
